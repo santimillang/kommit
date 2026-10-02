@@ -2,12 +2,16 @@ pub mod api_versions;
 pub mod create_topics;
 pub mod fetch;
 pub mod find_coordinator;
+pub mod heartbeat;
+pub mod join_group;
+pub mod leave_group;
 pub mod list_offsets;
 pub mod metadata;
 pub mod offset_commit;
 pub mod offset_fetch;
 pub mod produce;
 pub mod records;
+pub mod sync_group;
 
 use kafka_protocol::ResponseError;
 use kafka_protocol::messages::{ApiKey, RequestKind, ResponseKind};
@@ -26,6 +30,10 @@ pub const SUPPORTED: &[(ApiKey, i16, i16)] = &[
     (ApiKey::FindCoordinator, 0, 6),
     (ApiKey::OffsetCommit, 2, 9),
     (ApiKey::OffsetFetch, 1, 9),
+    (ApiKey::JoinGroup, 0, 9),
+    (ApiKey::SyncGroup, 0, 5),
+    (ApiKey::Heartbeat, 0, 4),
+    (ApiKey::LeaveGroup, 0, 5),
 ];
 
 pub fn supported_range(key: ApiKey) -> Option<(i16, i16)> {
@@ -79,6 +87,16 @@ pub async fn dispatch(
         RequestKind::OffsetFetch(r) => Some(ResponseKind::OffsetFetch(
             offset_fetch::handle(broker, ctx, r).await,
         )),
+        RequestKind::JoinGroup(r) => Some(ResponseKind::JoinGroup(
+            join_group::handle(broker, ctx, r).await,
+        )),
+        RequestKind::SyncGroup(r) => Some(ResponseKind::SyncGroup(
+            sync_group::handle(broker, ctx, r).await,
+        )),
+        RequestKind::Heartbeat(r) => Some(ResponseKind::Heartbeat(heartbeat::handle(broker, r))),
+        RequestKind::LeaveGroup(r) => Some(ResponseKind::LeaveGroup(leave_group::handle(
+            broker, ctx, r,
+        ))),
         // The server only dispatches APIs listed in SUPPORTED.
         _ => None,
     }
