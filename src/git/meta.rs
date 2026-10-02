@@ -17,6 +17,8 @@ pub enum MetaEvent {
         partitions: i32,
         topic_id: uuid::Uuid,
     },
+    /// Producer ids below `up_to` may have been handed out; a restart resumes there.
+    AllocateProducerIds { up_to: i64 },
 }
 
 pub fn append(store: &GitStore, event: &MetaEvent, now_ms: i64) -> Result<()> {
@@ -70,7 +72,10 @@ mod tests {
     fn events_replay_in_order_across_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("d.git");
-        let (a, b) = (create("orders", 3), create("payments", 1));
+        let (a, b) = (
+            create("orders", 3),
+            MetaEvent::AllocateProducerIds { up_to: 1000 },
+        );
         {
             let store = GitStore::open_or_init(&path).unwrap();
             append(&store, &a, 1_000).unwrap();

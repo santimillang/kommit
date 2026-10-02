@@ -74,17 +74,29 @@ fn validate_partitions(partitions: i32) -> Result<(), CreateTopicError> {
     }
 }
 
+/// Producer ids are recorded in blocks so a restart never hands one out twice.
+const PRODUCER_ID_BLOCK: i64 = 1000;
+
+struct ProducerIds {
+    next: i64,
+    /// Ids below this are covered by a recorded AllocateProducerIds event.
+    allocated_up_to: i64,
+}
+
 pub struct Broker {
     pub config: Config,
     storage: Arc<dyn Storage>,
     topics: RwLock<BTreeMap<String, Arc<TopicState>>>,
     appended: watch::Sender<u64>,
+    producer_ids: tokio::sync::Mutex<ProducerIds>,
+    known_groups: Vec<String>,
 }
 
 impl Broker {
     pub async fn start(config: Config, storage: Arc<dyn Storage>) -> anyhow::Result<Arc<Self>> {
+        let loaded = storage.load().await?;
         let mut topics = BTreeMap::new();
-        for t in storage.load_topics().await? {
+        for t in loaded.topics {
             topics.insert(
                 t.name,
                 Arc::new(TopicState {
@@ -98,7 +110,30 @@ impl Broker {
             storage,
             topics: RwLock::new(topics),
             appended: watch::channel(0).0,
+            producer_ids: tokio::sync::Mutex::new(ProducerIds {
+                next: loaded.producer_id_high,
+                allocated_up_to: loaded.producer_id_high,
+            }),
+            known_groups: loaded.groups,
         }))
+    }
+
+    /// Groups that had committed offsets when the broker started, sorted.
+    pub fn known_groups(&self) -> Vec<String> {
+        self.known_groups.clone()
+    }
+
+    /// A producer id never handed out before, even across restarts.
+    pub async fn next_producer_id(&self) -> anyhow::Result<i64> {
+        let mut ids = self.producer_ids.lock().await;
+        if ids.next >= ids.allocated_up_to {
+            let up_to = ids.allocated_up_to + PRODUCER_ID_BLOCK;
+            self.storage.allocate_producer_ids(up_to).await?;
+            ids.allocated_up_to = up_to;
+        }
+        let id = ids.next;
+        ids.next += 1;
+        Ok(id)
     }
 
     pub async fn topic(&self, name: &str) -> Option<Arc<TopicState>> {
@@ -211,6 +246,53 @@ mod tests {
             Err(CreateTopicError::InvalidPartitions(0))
         ));
         assert_eq!(broker.topics().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn producer_ids_keep_increasing_across_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.git");
+        let first: Vec<i64> = {
+            let store = Arc::new(GitStore::open_or_init(&path).unwrap());
+            let broker = Broker::start(Config::for_tests(), Arc::new(GitStorage::new(store)))
+                .await
+                .unwrap();
+            let mut ids = Vec::new();
+            for _ in 0..3 {
+                ids.push(broker.next_producer_id().await.unwrap());
+            }
+            ids
+        };
+        assert_eq!(first, vec![0, 1, 2]);
+        let store = Arc::new(GitStore::open_or_init(&path).unwrap());
+        let broker = Broker::start(Config::for_tests(), Arc::new(GitStorage::new(store)))
+            .await
+            .unwrap();
+        let next = broker.next_producer_id().await.unwrap();
+        assert!(next > 2, "reused producer id {next}");
+    }
+
+    #[tokio::test]
+    async fn groups_with_committed_offsets_are_known_after_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.git");
+        {
+            let store = Arc::new(GitStore::open_or_init(&path).unwrap());
+            let broker = Broker::start(Config::for_tests(), Arc::new(GitStorage::new(store)))
+                .await
+                .unwrap();
+            let t = broker.create_topic("orders", 2).await.unwrap();
+            t.partitions[1].commit_offset("my group", 0).await.unwrap();
+            t.partitions[0].commit_offset("billing", 0).await.unwrap();
+        }
+        let store = Arc::new(GitStore::open_or_init(&path).unwrap());
+        let broker = Broker::start(Config::for_tests(), Arc::new(GitStorage::new(store)))
+            .await
+            .unwrap();
+        assert_eq!(
+            broker.known_groups(),
+            vec!["billing".to_string(), "my group".to_string()]
+        );
     }
 
     #[tokio::test]

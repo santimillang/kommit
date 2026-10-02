@@ -5,6 +5,7 @@ use uuid::Uuid;
 
 use crate::git::meta::{self, MetaEvent};
 use crate::git::store::GitStore;
+use crate::groups::group_from_ref_component;
 use crate::log::PartitionLog;
 use crate::log::git::{GitLog, partition_ref};
 use crate::log::mem::MemLog;
@@ -16,23 +17,35 @@ pub struct LoadedTopic {
     pub partitions: Vec<Arc<dyn PartitionLog>>,
 }
 
+/// Everything a broker rebuilds from storage on startup.
+#[derive(Default)]
+pub struct Loaded {
+    pub topics: Vec<LoadedTopic>,
+    /// Groups that have committed offsets, sorted.
+    pub groups: Vec<String>,
+    /// Producer ids below this may already have been handed out.
+    pub producer_id_high: i64,
+}
+
 #[async_trait::async_trait]
 pub trait Storage: Send + Sync {
-    async fn load_topics(&self) -> Result<Vec<LoadedTopic>>;
+    async fn load(&self) -> Result<Loaded>;
     async fn create_topic(
         &self,
         name: &str,
         topic_id: Uuid,
         partitions: i32,
     ) -> Result<Vec<Arc<dyn PartitionLog>>>;
+    /// Durably records that producer ids below `up_to` may be in use.
+    async fn allocate_producer_ids(&self, up_to: i64) -> Result<()>;
 }
 
 pub struct MemStorage;
 
 #[async_trait::async_trait]
 impl Storage for MemStorage {
-    async fn load_topics(&self) -> Result<Vec<LoadedTopic>> {
-        Ok(Vec::new())
+    async fn load(&self) -> Result<Loaded> {
+        Ok(Loaded::default())
     }
 
     async fn create_topic(
@@ -44,6 +57,10 @@ impl Storage for MemStorage {
         Ok((0..partitions)
             .map(|_| Arc::new(MemLog::default()) as Arc<dyn PartitionLog>)
             .collect())
+    }
+
+    async fn allocate_producer_ids(&self, _up_to: i64) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -75,10 +92,16 @@ impl GitStorage {
 
 #[async_trait::async_trait]
 impl Storage for GitStorage {
-    async fn load_topics(&self) -> Result<Vec<LoadedTopic>> {
+    async fn load(&self) -> Result<Loaded> {
         let store = self.store.clone();
-        let events = tokio::task::spawn_blocking(move || meta::replay(&store)).await??;
-        let mut topics = Vec::new();
+        let (events, group_refs) = tokio::task::spawn_blocking(move || -> Result<_> {
+            Ok((
+                meta::replay(&store)?,
+                store.refs_with_prefix("refs/groups/")?,
+            ))
+        })
+        .await??;
+        let mut loaded = Loaded::default();
         for event in events {
             match event {
                 MetaEvent::CreateTopic {
@@ -87,15 +110,28 @@ impl Storage for GitStorage {
                     topic_id,
                 } => {
                     let partitions = self.open_partitions(&name, partitions).await?;
-                    topics.push(LoadedTopic {
+                    loaded.topics.push(LoadedTopic {
                         name,
                         topic_id,
                         partitions,
                     });
                 }
+                MetaEvent::AllocateProducerIds { up_to } => {
+                    loaded.producer_id_high = loaded.producer_id_high.max(up_to);
+                }
             }
         }
-        Ok(topics)
+        let mut groups: Vec<String> = group_refs
+            .iter()
+            .filter_map(|(name, _)| {
+                let component = name.strip_prefix("refs/groups/")?.split('/').next()?;
+                group_from_ref_component(component)
+            })
+            .collect();
+        groups.sort();
+        groups.dedup();
+        loaded.groups = groups;
+        Ok(loaded)
     }
 
     /// The metadata commit is the commit point: it is written before the branches.
@@ -125,5 +161,13 @@ impl Storage for GitStorage {
         })
         .await??;
         self.open_partitions(name, partitions).await
+    }
+
+    async fn allocate_producer_ids(&self, up_to: i64) -> Result<()> {
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || {
+            meta::append(&store, &MetaEvent::AllocateProducerIds { up_to }, now_ms())
+        })
+        .await?
     }
 }
