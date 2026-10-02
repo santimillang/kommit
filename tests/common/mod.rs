@@ -6,9 +6,10 @@ use std::sync::Arc;
 use bytes::{Bytes, BytesMut};
 use kafka_protocol::messages::create_topics_request::CreatableTopic;
 use kafka_protocol::messages::fetch_request::{FetchPartition, FetchTopic};
+use kafka_protocol::messages::list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic};
 use kafka_protocol::messages::metadata_request::MetadataRequestTopic;
 use kafka_protocol::messages::produce_request::{PartitionProduceData, TopicProduceData};
-use kafka_protocol::messages::{BrokerId, FetchRequest};
+use kafka_protocol::messages::{BrokerId, FetchRequest, ListOffsetsRequest};
 use kafka_protocol::messages::{
     CreateTopicsRequest, MetadataRequest, ProduceRequest, RequestHeader, ResponseHeader, TopicName,
 };
@@ -105,6 +106,20 @@ pub fn fetch_req(
                         .with_partition(partition)
                         .with_fetch_offset(offset)
                         .with_partition_max_bytes(partition_max_bytes),
+                ]),
+        ])
+}
+
+pub fn list_offsets_req(topic: &str, partition: i32, timestamp: i64) -> ListOffsetsRequest {
+    ListOffsetsRequest::default()
+        .with_replica_id(BrokerId(-1))
+        .with_topics(vec![
+            ListOffsetsTopic::default()
+                .with_name(topic_name(topic))
+                .with_partitions(vec![
+                    ListOffsetsPartition::default()
+                        .with_partition_index(partition)
+                        .with_timestamp(timestamp),
                 ]),
         ])
 }
