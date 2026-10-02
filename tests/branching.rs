@@ -128,6 +128,11 @@ async fn bad_branch_requests_are_refused_with_a_reason() {
     req.topics[0].num_partitions = 3;
     let r = c.send(7, req).await;
     assert_eq!(r.topics[0].error_code, INVALID_CONFIG);
+    // like Kafka, a failed result leaves the counts unknown
+    assert_eq!(
+        (r.topics[0].num_partitions, r.topics[0].replication_factor),
+        (-1, -1)
+    );
     // the matching count is fine
     let mut req = common::branch_topic_req("r6", "orders", None);
     req.topics[0].num_partitions = 2;

@@ -10,13 +10,14 @@ pub async fn handle(broker: &Broker, req: CreateTopicsRequest) -> CreateTopicsRe
     let mut results = Vec::new();
     for t in req.topics {
         let name = t.name.0.to_string();
+        // Like Kafka, a failed result leaves the partition count and replication unknown.
         let result = CreatableTopicResult::default()
             .with_name(t.name.clone())
-            .with_replication_factor(1);
+            .with_num_partitions(-1)
+            .with_replication_factor(-1);
         if t.replication_factor != -1 && t.replication_factor != 1 {
             results.push(
                 result
-                    .with_num_partitions(t.num_partitions)
                     .with_error_code(ResponseError::InvalidReplicationFactor.code())
                     .with_error_message(Some(StrBytes::from_static_str(
                         "kommit is a single broker",
@@ -57,9 +58,9 @@ pub async fn handle(broker: &Broker, req: CreateTopicsRequest) -> CreateTopicsRe
         results.push(match outcome {
             Ok((partitions, id)) => result
                 .with_num_partitions(partitions)
+                .with_replication_factor(1)
                 .with_topic_id(id.unwrap_or_default()),
             Err(e) => result
-                .with_num_partitions(t.num_partitions)
                 .with_error_code(e.code())
                 .with_error_message(Some(StrBytes::from_string(e.to_string()))),
         });
