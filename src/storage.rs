@@ -12,6 +12,12 @@ use crate::log::git::{GitLog, Origin, check_root, partition_ref};
 use crate::log::mem::MemLog;
 use crate::record::{Offset, now_ms};
 
+/// A create or branch whose metadata commit landed but whose branches could not all be
+/// opened. The topic is in the meta log, and the next startup creates what is missing.
+#[derive(Debug, thiserror::Error)]
+#[error("{0:#}; the topic is recorded, so restarting kommit will finish creating it")]
+pub struct RecordedButNotOpened(pub anyhow::Error);
+
 pub struct LoadedTopic {
     pub name: String,
     pub topic_id: Uuid,
@@ -249,7 +255,9 @@ impl Storage for GitStorage {
             meta::append(&store, &event, now_ms())
         })
         .await??;
-        self.open_partitions(name, partitions).await
+        self.open_partitions(name, partitions)
+            .await
+            .map_err(|e| RecordedButNotOpened(e).into())
     }
 
     /// Like create_topic, the metadata commit is the commit point and existing refs are
@@ -305,7 +313,9 @@ impl Storage for GitStorage {
             Ok(heads)
         })
         .await??;
-        self.open_forks(name, root, &heads).await
+        self.open_forks(name, root, &heads)
+            .await
+            .map_err(|e| RecordedButNotOpened(e).into())
     }
 
     async fn allocate_producer_ids(&self, up_to: i64) -> Result<()> {

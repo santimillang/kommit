@@ -10,7 +10,7 @@ use crate::branch::{self, BRANCH_FROM, BranchSpec, ResolveError};
 use crate::config::Config;
 use crate::groups::coordinator::Coordinator;
 use crate::log::PartitionLog;
-use crate::storage::Storage;
+use crate::storage::{RecordedButNotOpened, Storage};
 
 /// Upper bound on partitions per topic. Each partition is a branch walked at startup,
 /// and the CreateTopic event is replayed forever, so an absurd count must never be recorded.
@@ -83,16 +83,28 @@ fn validate_partitions(partitions: i32) -> Result<(), CreateTopicError> {
     }
 }
 
-/// Releases a name reserved by `Broker::branch_topic`, whether it succeeded or not.
+/// Releases a name reserved by `Broker::branch_topic` when the branch ends, unless kept.
 struct Reservation<'a> {
-    branching: &'a std::sync::Mutex<std::collections::BTreeSet<String>>,
+    reserved: &'a std::sync::Mutex<std::collections::BTreeSet<String>>,
     name: &'a str,
+}
+
+impl Reservation<'_> {
+    /// Keeps the name reserved until restart.
+    fn keep(self) {
+        std::mem::forget(self);
+    }
 }
 
 impl Drop for Reservation<'_> {
     fn drop(&mut self) {
-        self.branching.lock().unwrap().remove(self.name);
+        self.reserved.lock().unwrap().remove(self.name);
     }
+}
+
+/// Whether a storage failure happened after the topic was recorded in the meta log.
+fn is_recorded(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<RecordedButNotOpened>().is_some()
 }
 
 /// Producer ids are recorded in blocks so a restart never hands one out twice.
@@ -108,9 +120,11 @@ pub struct Broker {
     pub config: Config,
     storage: Arc<dyn Storage>,
     topics: RwLock<BTreeMap<String, Arc<TopicState>>>,
-    /// Names being branched right now. A fork walks whole histories, so it reserves its
-    /// name here instead of holding the topics lock while storage works.
-    branching: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    /// Names that are taken without being in `topics`: forks in progress (a fork walks
+    /// whole histories, so it reserves its name instead of holding the topics lock), and
+    /// topics recorded in the meta log whose branches failed to open, which a restart
+    /// finishes. Creating either again would record a second, conflicting topic.
+    reserved: std::sync::Mutex<std::collections::BTreeSet<String>>,
     appended: watch::Sender<u64>,
     producer_ids: tokio::sync::Mutex<ProducerIds>,
     known_groups: Vec<String>,
@@ -140,7 +154,7 @@ impl Broker {
             coordinator,
             idempotence: IdempotenceCache::default(),
             topics: RwLock::new(topics),
-            branching: Default::default(),
+            reserved: Default::default(),
             appended: watch::channel(0).0,
             producer_ids: tokio::sync::Mutex::new(ProducerIds {
                 next: loaded.producer_id_high,
@@ -203,7 +217,7 @@ impl Broker {
         validate_partitions(partitions)?;
         // Hold the write lock across storage so two creators cannot race.
         let mut topics = self.topics.write().await;
-        if topics.contains_key(name) || self.branching.lock().unwrap().contains(name) {
+        if topics.contains_key(name) || self.reserved.lock().unwrap().contains(name) {
             return Err(CreateTopicError::AlreadyExists);
         }
         let topic_id = Uuid::new_v4();
@@ -211,7 +225,12 @@ impl Broker {
             .storage
             .create_topic(name, topic_id, partitions)
             .await
-            .map_err(|e| CreateTopicError::Storage(format!("{e:#}")))?;
+            .map_err(|e| {
+                if is_recorded(&e) {
+                    self.reserved.lock().unwrap().insert(name.to_string());
+                }
+                CreateTopicError::Storage(format!("{e:#}"))
+            })?;
         let state = Arc::new(TopicState {
             topic_id,
             root: name.to_string(),
@@ -224,7 +243,7 @@ impl Broker {
 
     /// Forks `spec.from` as `name`. Resolving fork points and writing the fork both read
     /// whole histories, so neither holds the topics lock: the name is reserved in
-    /// `branching` instead, which is safe because logs only grow.
+    /// `reserved` instead, which is safe because logs only grow.
     /// Returns the fork's partition count and, unless `validate_only`, the new topic.
     pub async fn branch_topic(
         &self,
@@ -234,7 +253,9 @@ impl Broker {
         validate_only: bool,
     ) -> Result<(i32, Option<Arc<TopicState>>), CreateTopicError> {
         validate_topic_name(name).map_err(CreateTopicError::InvalidName)?;
-        if self.topics.read().await.contains_key(name) {
+        if self.topics.read().await.contains_key(name)
+            || self.reserved.lock().unwrap().contains(name)
+        {
             return Err(CreateTopicError::AlreadyExists);
         }
         let source = self.topic(&spec.from).await.ok_or_else(|| {
@@ -258,19 +279,19 @@ impl Broker {
         if validate_only {
             return Ok((count, None));
         }
-        let _reserved = {
+        let reservation = {
             let topics = self.topics.read().await;
-            let mut branching = self.branching.lock().unwrap();
-            if topics.contains_key(name) || !branching.insert(name.to_string()) {
+            let mut reserved = self.reserved.lock().unwrap();
+            if topics.contains_key(name) || !reserved.insert(name.to_string()) {
                 return Err(CreateTopicError::AlreadyExists);
             }
             Reservation {
-                branching: &self.branching,
+                reserved: &self.reserved,
                 name,
             }
         };
         let topic_id = Uuid::new_v4();
-        let logs = self
+        let logs = match self
             .storage
             .branch_topic(
                 name,
@@ -281,7 +302,15 @@ impl Broker {
                 &at,
             )
             .await
-            .map_err(|e| CreateTopicError::Storage(format!("{e:#}")))?;
+        {
+            Ok(logs) => logs,
+            Err(e) => {
+                if is_recorded(&e) {
+                    reservation.keep();
+                }
+                return Err(CreateTopicError::Storage(format!("{e:#}")));
+            }
+        };
         let state = Arc::new(TopicState {
             topic_id,
             root: source.root.clone(),
@@ -292,6 +321,7 @@ impl Broker {
             .write()
             .await
             .insert(name.to_string(), state.clone());
+        drop(reservation);
         tracing::info!(topic = name, from = %spec.from, ?at, "branched topic");
         Ok((count, Some(state)))
     }
@@ -375,6 +405,97 @@ mod tests {
         async fn allocate_producer_ids(&self, _up_to: i64) -> anyhow::Result<()> {
             Ok(())
         }
+    }
+
+    /// MemStorage whose branches and creates are recorded but then fail to open, like an
+    /// I/O error between the meta commit and the refs.
+    #[derive(Default)]
+    struct RecordedThenFails {
+        creates: std::sync::atomic::AtomicUsize,
+    }
+
+    fn recorded_failure() -> anyhow::Error {
+        crate::storage::RecordedButNotOpened(anyhow::anyhow!("disk on fire")).into()
+    }
+
+    #[async_trait::async_trait]
+    impl Storage for RecordedThenFails {
+        async fn load(&self) -> anyhow::Result<crate::storage::Loaded> {
+            MemStorage.load().await
+        }
+        async fn create_topic(
+            &self,
+            name: &str,
+            topic_id: Uuid,
+            partitions: i32,
+        ) -> anyhow::Result<Vec<Arc<dyn PartitionLog>>> {
+            self.creates
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if name == "broken-create" {
+                return Err(recorded_failure());
+            }
+            MemStorage.create_topic(name, topic_id, partitions).await
+        }
+        async fn branch_topic(
+            &self,
+            _name: &str,
+            _topic_id: Uuid,
+            _from: &str,
+            _root: &str,
+            _source: &[Arc<dyn PartitionLog>],
+            _at: &[crate::record::Offset],
+        ) -> anyhow::Result<Vec<Arc<dyn PartitionLog>>> {
+            Err(recorded_failure())
+        }
+        async fn allocate_producer_ids(&self, _up_to: i64) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_recorded_but_unopened_topic_keeps_its_name_until_restart() {
+        let storage = Arc::new(RecordedThenFails::default());
+        let broker = Broker::start(Config::for_tests(), storage.clone())
+            .await
+            .unwrap();
+        broker.create_topic("orders", 1).await.unwrap();
+        let spec = BranchSpec {
+            from: "orders".into(),
+            at: crate::branch::BranchAt::Head,
+        };
+        let err = broker
+            .branch_topic("replay", -1, &spec, false)
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(err, CreateTopicError::Storage(_)), "{err:?}");
+        assert!(err.to_string().contains("restart"), "{err}");
+        let err = broker.create_topic("broken-create", 1).await.err().unwrap();
+        assert!(err.to_string().contains("restart"), "{err}");
+
+        let creates_before = storage.creates.load(std::sync::atomic::Ordering::SeqCst);
+        for name in ["replay", "broken-create"] {
+            assert!(
+                matches!(
+                    broker.create_topic(name, 1).await,
+                    Err(CreateTopicError::AlreadyExists)
+                ),
+                "{name}"
+            );
+            assert!(
+                matches!(
+                    broker.branch_topic(name, -1, &spec, false).await,
+                    Err(CreateTopicError::AlreadyExists)
+                ),
+                "{name}"
+            );
+            // auto-create must not record a second, conflicting topic either
+            assert!(broker.get_or_auto_create(name).await.unwrap().is_none());
+        }
+        assert_eq!(
+            storage.creates.load(std::sync::atomic::Ordering::SeqCst),
+            creates_before
+        );
     }
 
     #[tokio::test]
