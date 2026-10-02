@@ -47,7 +47,12 @@ pub enum Origin {
 }
 
 /// Checks that `chain` (oldest first) starts at the sentinel of `expected`.
-fn check_root(s: &GitStore, what: &str, chain: &[ObjectId], expected: &str) -> anyhow::Result<()> {
+pub(crate) fn check_root(
+    s: &GitStore,
+    what: &str,
+    chain: &[ObjectId],
+    expected: &str,
+) -> anyhow::Result<()> {
     match s.with_commit(chain[0], |c| Ok(sentinel_of(c)))? {
         Some(found) if found == expected => Ok(()),
         Some(found) => bail!("{what} starts at the sentinel of partition {found}, not {expected}"),

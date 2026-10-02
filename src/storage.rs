@@ -8,7 +8,7 @@ use crate::git::meta::{self, MetaEvent};
 use crate::git::store::GitStore;
 use crate::groups::group_from_ref_component;
 use crate::log::PartitionLog;
-use crate::log::git::{GitLog, Origin, partition_ref};
+use crate::log::git::{GitLog, Origin, check_root, partition_ref};
 use crate::log::mem::MemLog;
 use crate::record::{Offset, now_ms};
 
@@ -284,6 +284,9 @@ impl Storage for GitStorage {
                     .ref_target(&src)?
                     .with_context(|| format!("{src} is missing"))?;
                 let chain = store.first_parent_chain(head)?;
+                // Checked before the meta commit: a fork recorded with a bad root could
+                // never be opened, and the broker would refuse to start.
+                check_root(&store, &src, &chain, &format!("{root_name}/{p}"))?;
                 let id = usize::try_from(n)
                     .ok()
                     .and_then(|i| chain.get(i).copied())
@@ -441,6 +444,45 @@ mod tests {
         }
         let loaded = open(&path).load().await.unwrap();
         assert_eq!(loaded.topics.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn branching_a_source_moved_onto_another_topic_records_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.git");
+        {
+            let storage = open(&path);
+            let source = orders(&storage).await;
+            storage
+                .create_topic("payments", Uuid::new_v4(), 1)
+                .await
+                .unwrap();
+            // someone points orders/1 at payments' history behind kommit's back
+            let s = &storage.store;
+            let old = s.ref_target("refs/heads/orders/1").unwrap().unwrap();
+            let foreign = s.ref_target("refs/heads/payments/0").unwrap().unwrap();
+            s.cas_ref("refs/heads/orders/1", Some(old), foreign, "vandal")
+                .unwrap();
+            let err = storage
+                .branch_topic(
+                    "replay",
+                    Uuid::new_v4(),
+                    "orders",
+                    "orders",
+                    &source,
+                    &[1, 0],
+                )
+                .await
+                .err()
+                .unwrap();
+            assert!(err.to_string().contains("payments/0"), "{err:#}");
+            assert_eq!(s.ref_target("refs/heads/replay/0").unwrap(), None);
+            // put orders/1 back so the restart below only tests the branch
+            s.cas_ref("refs/heads/orders/1", Some(foreign), old, "repair")
+                .unwrap();
+        }
+        let loaded = open(&path).load().await.unwrap();
+        assert!(loaded.topics.iter().all(|t| t.name != "replay"));
     }
 
     #[tokio::test]
