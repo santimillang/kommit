@@ -231,11 +231,11 @@ impl Group {
         let delay_over = self.initial_delay_until.is_none_or(|t| now >= t);
         let overdue = self.rebalance_deadline.is_some_and(|t| now >= t);
         if (all_joined && delay_over) || overdue {
-            self.complete_join();
+            self.complete_join(now);
         }
     }
 
-    fn complete_join(&mut self) {
+    fn complete_join(&mut self, now: Instant) {
         // Members that did not rejoin in time are out.
         self.members.retain(|_, m| m.pending_join.is_some());
         self.rebalance_deadline = None;
@@ -272,6 +272,8 @@ impl Group {
             .collect();
         for (id, member) in self.members.iter_mut() {
             member.assignment = Bytes::new();
+            // A parked join sends no heartbeats; the session restarts now, as in Kafka.
+            member.last_seen = now;
             if let Some(reply) = member.pending_join.take() {
                 let _ = reply.send(Ok(JoinResponse {
                     generation: self.generation,
@@ -290,11 +292,15 @@ impl Group {
     }
 
     fn tick(&mut self, now: Instant) {
-        // A member parked in a join is alive; it is waiting on us, not silent.
+        // A member parked in a join or sync is alive; it is waiting on us, not silent.
         let expired: Vec<String> = self
             .members
             .iter()
-            .filter(|(_, m)| m.pending_join.is_none() && now - m.last_seen > m.session_timeout)
+            .filter(|(_, m)| {
+                m.pending_join.is_none()
+                    && m.pending_sync.is_none()
+                    && now - m.last_seen > m.session_timeout
+            })
             .map(|(id, _)| id.clone())
             .collect();
         for id in expired {
@@ -511,7 +517,9 @@ impl Coordinator {
             .ok_or(CoordError::UnknownMemberId)?;
         let state = group.state;
         group.member(member_id, generation)?;
-        if state == GroupState::PreparingRebalance {
+        // As in Kafka: members commit while a rebalance is being prepared (that is what
+        // it is for), but not once it is completing, when partitions may have moved.
+        if state == GroupState::CompletingRebalance {
             return Err(CoordError::RebalanceInProgress);
         }
         Ok(())
@@ -708,6 +716,96 @@ mod tests {
         assert_eq!(
             c.heartbeat("g", 2, &leader),
             Err(CoordError::UnknownMemberId)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn early_rejoiners_survive_a_rebalance_slower_than_their_session() {
+        let c = Coordinator::start(DELAY, vec![]);
+        let (leader, follower) = stable_pair(&c).await;
+        let newcomer = tokio::spawn({
+            let c = c.clone();
+            async move { c.join(join_req("", "c")).await }
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        // the leader rejoins at once; the follower keeps heartbeating (as Java's
+        // heartbeat thread does) but only rejoins after 3s; the session timeout is 1s
+        let early = tokio::spawn({
+            let c = c.clone();
+            let leader = leader.clone();
+            async move { c.join(join_req(&leader, "a")).await }
+        });
+        for _ in 0..15 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert_eq!(
+                c.heartbeat("g", 1, &follower),
+                Err(CoordError::RebalanceInProgress)
+            );
+        }
+        let late = c.join(join_req(&follower, "b")).await.unwrap();
+        let early = early.await.unwrap().unwrap();
+        newcomer.await.unwrap().unwrap();
+        assert_eq!(early.generation, late.generation);
+        // a few ticks later, the early rejoiner must still be a member
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(c.heartbeat("g", early.generation, &leader), Ok(()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_follower_waiting_on_a_slow_leaders_sync_is_not_evicted() {
+        let c = Coordinator::start(DELAY, vec![]);
+        let (a, b) = tokio::join!(c.join(join_req("", "a")), c.join(join_req("", "b")));
+        let (a, b) = (a.unwrap(), b.unwrap());
+        let (leader, follower) = if a.leader == a.member_id {
+            (a, b)
+        } else {
+            (b, a)
+        };
+        let parked = tokio::spawn({
+            let c = c.clone();
+            let id = follower.member_id.clone();
+            async move { c.sync("g", 1, &id, vec![]).await }
+        });
+        // the leader computes assignments for longer than the follower's session timeout,
+        // heartbeating meanwhile as a real client's background thread does
+        for _ in 0..15 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert_eq!(c.heartbeat("g", 1, &leader.member_id), Ok(()));
+        }
+        c.sync(
+            "g",
+            1,
+            &leader.member_id,
+            vec![(follower.member_id.clone(), Bytes::from_static(b"F"))],
+        )
+        .await
+        .unwrap();
+        assert_eq!(parked.await.unwrap().unwrap(), "F");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn commits_are_allowed_while_preparing_and_refused_while_completing() {
+        let c = Coordinator::start(DELAY, vec![]);
+        let (leader, follower) = stable_pair(&c).await;
+        // a newcomer starts a rebalance: members commit before giving up partitions
+        let newcomer = tokio::spawn({
+            let c = c.clone();
+            async move { c.join(join_req("", "c")).await }
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(c.validate_commit("g", 1, &leader), Ok(()));
+        // once the join completes, generation 1 commits are stale and the group is
+        // completing: partitions may already belong to someone else
+        let (l, f) = tokio::join!(
+            c.join(join_req(&leader, "a")),
+            c.join(join_req(&follower, "b"))
+        );
+        newcomer.await.unwrap().unwrap();
+        let generation = l.unwrap().generation;
+        f.unwrap();
+        assert_eq!(
+            c.validate_commit("g", generation, &leader),
+            Err(CoordError::RebalanceInProgress)
         );
     }
 
