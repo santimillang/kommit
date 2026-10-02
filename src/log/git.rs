@@ -37,32 +37,63 @@ fn storage(e: impl std::fmt::Display) -> LogError {
     LogError::Storage(format!("{e:#}"))
 }
 
+/// How a partition branch that does not exist yet comes to be.
+pub enum Origin {
+    /// A new, empty partition rooted at its own sentinel.
+    New,
+    /// A fork created pointing at `at`, which must lie on a branch rooted at the sentinel
+    /// of `<root>/<partition>`. `root` is the original topic, even for a fork of a fork.
+    Fork { root: String, at: ObjectId },
+}
+
+/// Checks that `chain` (oldest first) starts at the sentinel of `expected`.
+fn check_root(s: &GitStore, what: &str, chain: &[ObjectId], expected: &str) -> anyhow::Result<()> {
+    match s.with_commit(chain[0], |c| Ok(sentinel_of(c)))? {
+        Some(found) if found == expected => Ok(()),
+        Some(found) => bail!("{what} starts at the sentinel of partition {found}, not {expected}"),
+        None => bail!("{what} does not start at a kommit sentinel commit"),
+    }
+}
+
 impl GitLog {
     pub async fn open_or_create(
         store: Arc<GitStore>,
         topic: &str,
         partition: i32,
     ) -> anyhow::Result<Self> {
+        Self::open(store, topic, partition, Origin::New).await
+    }
+
+    pub async fn open(
+        store: Arc<GitStore>,
+        topic: &str,
+        partition: i32,
+        origin: Origin,
+    ) -> anyhow::Result<Self> {
         let ref_name = partition_ref(topic, partition);
         let (s, r, t) = (store.clone(), ref_name.clone(), topic.to_string());
         let index = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<ObjectId>> {
-            match s.ref_target(&r)? {
-                Some(head) => {
-                    let chain = s.first_parent_chain(head)?;
-                    let expected = format!("{t}/{partition}");
-                    match s.with_commit(chain[0], |c| Ok(sentinel_of(c)))? {
-                        Some(found) if found == expected => Ok(chain),
-                        Some(found) => {
-                            bail!("{r} starts at the sentinel of partition {found}, not {expected}")
-                        }
-                        None => bail!("{r} does not start at a kommit sentinel commit"),
-                    }
-                }
-                None => {
+            let expected = match &origin {
+                Origin::New => format!("{t}/{partition}"),
+                Origin::Fork { root, .. } => format!("{root}/{partition}"),
+            };
+            if let Some(head) = s.ref_target(&r)? {
+                let chain = s.first_parent_chain(head)?;
+                check_root(&s, &r, &chain, &expected)?;
+                return Ok(chain);
+            }
+            match origin {
+                Origin::New => {
                     let sentinel = sentinel_commit(&t, partition, s.empty_tree(), now_ms());
                     let id = s.write_commit(&sentinel)?;
                     s.cas_ref(&r, None, id, "kommit: create partition")?;
                     Ok(vec![id])
+                }
+                Origin::Fork { at, .. } => {
+                    let chain = s.first_parent_chain(at)?;
+                    check_root(&s, &format!("fork point {at} for {r}"), &chain, &expected)?;
+                    s.cas_ref(&r, None, at, "kommit: branch partition")?;
+                    Ok(chain)
                 }
             }
         })
@@ -394,6 +425,138 @@ mod tests {
             .unwrap();
         let err = GitLog::open_or_create(s, "orders", 0).await.err().unwrap();
         assert!(err.to_string().contains("payments/0"), "{err:#}");
+    }
+
+    /// orders/0 with `n` records; returns its first-parent chain (sentinel first).
+    async fn source(s: &Arc<GitStore>, n: i64) -> Vec<ObjectId> {
+        let log = GitLog::open_or_create(s.clone(), "orders", 0)
+            .await
+            .unwrap();
+        let recs = (0..n).map(|i| Record::text(i, &format!("r{i}"))).collect();
+        log.append("app", recs).await.unwrap();
+        let head = s.ref_target("refs/heads/orders/0").unwrap().unwrap();
+        s.first_parent_chain(head).unwrap()
+    }
+
+    fn fork_at(at: ObjectId) -> Origin {
+        Origin::Fork {
+            root: "orders".into(),
+            at,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fork_shares_commits_and_diverges_on_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(&dir);
+        let chain = source(&s, 3).await;
+        // fork point 2: shares offsets 0 and 1
+        let fork = GitLog::open(s.clone(), "replay", 0, fork_at(chain[2]))
+            .await
+            .unwrap();
+        assert_eq!(fork.high_watermark(), 2);
+        let orders = GitLog::open_or_create(s.clone(), "orders", 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            fork.read(0, 1 << 20).await.unwrap(),
+            orders.read(0, 1 << 20).await.unwrap()[..2].to_vec()
+        );
+
+        let repo = dir.path().join("d.git");
+        let rev = |r: &str| git(&repo, &["rev-parse", r]).trim().to_string();
+        assert_eq!(rev("replay/0"), rev("orders/0~1"));
+
+        assert_eq!(
+            fork.append("app", vec![Record::text(9, "mine")])
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(orders.high_watermark(), 3);
+        assert_eq!(rev("orders/0"), chain[3].to_string());
+        assert_eq!(
+            git(&repo, &["merge-base", "orders/0", "replay/0"]).trim(),
+            chain[2].to_string()
+        );
+        git(&repo, &["fsck", "--strict", "--no-dangling"]);
+
+        // reopening keeps the fork's own head, not the fork point
+        drop(fork);
+        let fork = GitLog::open(s.clone(), "replay", 0, fork_at(chain[2]))
+            .await
+            .unwrap();
+        assert_eq!(fork.high_watermark(), 3);
+    }
+
+    #[tokio::test]
+    async fn forking_at_zero_points_at_the_shared_sentinel() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(&dir);
+        let chain = source(&s, 0).await;
+        let fork = GitLog::open(s.clone(), "replay", 0, fork_at(chain[0]))
+            .await
+            .unwrap();
+        assert_eq!(fork.high_watermark(), 0);
+        assert!(fork.read(0, 1024).await.unwrap().is_empty());
+        assert_eq!(
+            fork.append("app", vec![Record::text(1, "a")])
+                .await
+                .unwrap(),
+            0
+        );
+        let subjects = git(
+            &dir.path().join("d.git"),
+            &["log", "--format=%s", "replay/0"],
+        );
+        assert_eq!(subjects, "a\nkommit: partition orders/0 created\n");
+    }
+
+    #[tokio::test]
+    async fn a_fork_of_a_fork_keeps_the_original_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(&dir);
+        let chain = source(&s, 2).await;
+        let first = GitLog::open(s.clone(), "replay", 0, fork_at(chain[2]))
+            .await
+            .unwrap();
+        first
+            .append("app", vec![Record::text(5, "x")])
+            .await
+            .unwrap();
+        let head = s.ref_target("refs/heads/replay/0").unwrap().unwrap();
+        let second = GitLog::open(s.clone(), "replay2", 0, fork_at(head))
+            .await
+            .unwrap();
+        assert_eq!(second.high_watermark(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_fork_point_outside_the_root_topic_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(&dir);
+        drop(
+            GitLog::open_or_create(s.clone(), "payments", 0)
+                .await
+                .unwrap(),
+        );
+        let foreign = s.ref_target("refs/heads/payments/0").unwrap().unwrap();
+        let err = GitLog::open(s.clone(), "replay", 0, fork_at(foreign))
+            .await
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("payments/0"), "{err:#}");
+        assert_eq!(s.ref_target("refs/heads/replay/0").unwrap(), None);
+
+        // an existing fork opened as a plain topic is refused too
+        let chain = source(&s, 1).await;
+        drop(
+            GitLog::open(s.clone(), "replay", 0, fork_at(chain[1]))
+                .await
+                .unwrap(),
+        );
+        let err = GitLog::open_or_create(s, "replay", 0).await.err().unwrap();
+        assert!(err.to_string().contains("orders/0"), "{err:#}");
     }
 
     #[tokio::test]
