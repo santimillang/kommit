@@ -195,8 +195,12 @@ pub fn sentinel_commit(
     }
 }
 
-pub fn is_sentinel(c: &gix::objs::CommitRef<'_>) -> bool {
-    c.extra_headers.iter().any(|(name, _)| *name == H_SENTINEL)
+/// The `<topic>/<partition>` a sentinel commit was created for, or `None` if `c` is not a sentinel.
+pub fn sentinel_of(c: &gix::objs::CommitRef<'_>) -> Option<String> {
+    c.extra_headers
+        .iter()
+        .find(|(name, _)| *name == H_SENTINEL)
+        .map(|(_, value)| value.to_string())
 }
 
 #[cfg(test)]
@@ -308,7 +312,7 @@ mod tests {
             .detach();
         let commit = repo.find_commit(id).unwrap();
         let decoded = commit.decode().unwrap();
-        assert!(is_sentinel(&decoded));
+        assert_eq!(sentinel_of(&decoded).as_deref(), Some("orders/3"));
         assert_eq!(commit_to_record(&decoded), Err(DecodeError::Sentinel));
         assert_eq!(decoded.message, "kommit: partition orders/3 created\n");
     }

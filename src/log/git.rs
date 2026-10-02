@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use anyhow::bail;
 use gix::ObjectId;
 
-use crate::git::encode::{commit_to_record, is_sentinel, record_to_commit, sentinel_commit};
+use crate::git::encode::{commit_to_record, record_to_commit, sentinel_commit, sentinel_of};
 use crate::git::store::GitStore;
 use crate::log::{LogError, MAX_READ_RECORDS, PartitionLog, take_within_limit};
 use crate::record::{Offset, Record, now_ms};
@@ -37,10 +37,14 @@ impl GitLog {
             match s.ref_target(&r)? {
                 Some(head) => {
                     let chain = s.first_parent_chain(head)?;
-                    if !s.with_commit(chain[0], |c| Ok(is_sentinel(c)))? {
-                        bail!("{r} does not start at a kommit sentinel commit");
+                    let expected = format!("{t}/{partition}");
+                    match s.with_commit(chain[0], |c| Ok(sentinel_of(c)))? {
+                        Some(found) if found == expected => Ok(chain),
+                        Some(found) => {
+                            bail!("{r} starts at the sentinel of partition {found}, not {expected}")
+                        }
+                        None => bail!("{r} does not start at a kommit sentinel commit"),
                     }
-                    Ok(chain)
                 }
                 None => {
                     let sentinel = sentinel_commit(&t, partition, s.empty_tree(), now_ms());
@@ -267,6 +271,22 @@ mod tests {
         ));
         // history was not rewritten by kommit
         assert_eq!(s.ref_target("refs/heads/orders/0").unwrap(), Some(root));
+    }
+
+    #[tokio::test]
+    async fn another_partitions_branch_refuses_to_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(&dir);
+        drop(
+            GitLog::open_or_create(s.clone(), "payments", 0)
+                .await
+                .unwrap(),
+        );
+        let head = s.ref_target("refs/heads/payments/0").unwrap().unwrap();
+        s.cas_ref("refs/heads/orders/0", None, head, "copied")
+            .unwrap();
+        let err = GitLog::open_or_create(s, "orders", 0).await.err().unwrap();
+        assert!(err.to_string().contains("payments/0"), "{err:#}");
     }
 
     #[tokio::test]

@@ -9,6 +9,10 @@ use crate::config::Config;
 use crate::log::PartitionLog;
 use crate::storage::Storage;
 
+/// Upper bound on partitions per topic. Each partition is a branch walked at startup,
+/// and the CreateTopic event is replayed forever, so an absurd count must never be recorded.
+pub const MAX_PARTITIONS: i32 = 1000;
+
 pub struct TopicState {
     pub topic_id: Uuid,
     pub partitions: Vec<Arc<dyn PartitionLog>>,
@@ -62,6 +66,14 @@ pub fn validate_topic_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_partitions(partitions: i32) -> Result<(), CreateTopicError> {
+    if (1..=MAX_PARTITIONS).contains(&partitions) {
+        Ok(())
+    } else {
+        Err(CreateTopicError::InvalidPartitions(partitions))
+    }
+}
+
 pub struct Broker {
     pub config: Config,
     storage: Arc<dyn Storage>,
@@ -108,9 +120,7 @@ impl Broker {
         partitions: i32,
     ) -> Result<(), CreateTopicError> {
         validate_topic_name(name).map_err(CreateTopicError::InvalidName)?;
-        if partitions < 1 {
-            return Err(CreateTopicError::InvalidPartitions(partitions));
-        }
+        validate_partitions(partitions)?;
         if self.topics.read().await.contains_key(name) {
             return Err(CreateTopicError::AlreadyExists);
         }
@@ -123,9 +133,7 @@ impl Broker {
         partitions: i32,
     ) -> Result<Arc<TopicState>, CreateTopicError> {
         validate_topic_name(name).map_err(CreateTopicError::InvalidName)?;
-        if partitions < 1 {
-            return Err(CreateTopicError::InvalidPartitions(partitions));
-        }
+        validate_partitions(partitions)?;
         // Hold the write lock across storage so two creators cannot race.
         let mut topics = self.topics.write().await;
         if topics.contains_key(name) {
@@ -203,6 +211,63 @@ mod tests {
             Err(CreateTopicError::InvalidPartitions(0))
         ));
         assert_eq!(broker.topics().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn absurd_partition_counts_are_rejected_before_touching_storage() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.git");
+        let store = Arc::new(GitStore::open_or_init(&path).unwrap());
+        let broker = Broker::start(Config::for_tests(), Arc::new(GitStorage::new(store)))
+            .await
+            .unwrap();
+        for n in [MAX_PARTITIONS + 1, i32::MAX] {
+            assert!(matches!(
+                broker.create_topic("huge", n).await,
+                Err(CreateTopicError::InvalidPartitions(_))
+            ));
+            assert!(matches!(
+                broker.validate_new_topic("huge", n).await,
+                Err(CreateTopicError::InvalidPartitions(_))
+            ));
+        }
+        // nothing was recorded, so a restart is unaffected
+        drop(broker);
+        let store = GitStore::open_or_init(&path).unwrap();
+        assert!(crate::git::meta::replay(&store).unwrap().is_empty());
+
+        // the cap itself is allowed
+        let broker = mem_broker(true).await;
+        broker.create_topic("max", MAX_PARTITIONS).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn creating_over_a_foreign_branch_fails_without_recording_the_topic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.git");
+        {
+            let store = Arc::new(GitStore::open_or_init(&path).unwrap());
+            // someone hand-makes refs/heads/orders/0 from another topic's history
+            let other = crate::log::git::GitLog::open_or_create(store.clone(), "payments", 0)
+                .await
+                .unwrap();
+            drop(other);
+            let head = store.ref_target("refs/heads/payments/0").unwrap().unwrap();
+            store
+                .cas_ref("refs/heads/orders/0", None, head, "hand-made")
+                .unwrap();
+            let broker = Broker::start(Config::for_tests(), Arc::new(GitStorage::new(store)))
+                .await
+                .unwrap();
+            let err = broker.create_topic("orders", 1).await.err();
+            assert!(matches!(err, Some(CreateTopicError::Storage(_))), "{err:?}");
+        }
+        // the failed create left no metadata behind, so the broker still starts
+        let store = Arc::new(GitStore::open_or_init(&path).unwrap());
+        let broker = Broker::start(Config::for_tests(), Arc::new(GitStorage::new(store)))
+            .await
+            .unwrap();
+        assert!(broker.topic("orders").await.is_none());
     }
 
     #[tokio::test]

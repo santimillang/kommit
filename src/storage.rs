@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use uuid::Uuid;
 
 use crate::git::meta::{self, MetaEvent};
 use crate::git::store::GitStore;
 use crate::log::PartitionLog;
-use crate::log::git::GitLog;
+use crate::log::git::{GitLog, partition_ref};
 use crate::log::mem::MemLog;
 use crate::record::now_ms;
 
@@ -99,6 +99,8 @@ impl Storage for GitStorage {
     }
 
     /// The metadata commit is the commit point: it is written before the branches.
+    /// Branches that already exist (made by hand, or by another tool) are never adopted:
+    /// creation fails before anything is recorded, so a restart is unaffected.
     async fn create_topic(
         &self,
         name: &str,
@@ -111,7 +113,17 @@ impl Storage for GitStorage {
             partitions,
             topic_id,
         };
-        tokio::task::spawn_blocking(move || meta::append(&store, &event, now_ms())).await??;
+        let topic = name.to_string();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            for p in 0..partitions {
+                let r = partition_ref(&topic, p);
+                if store.ref_target(&r)?.is_some() {
+                    bail!("{r} already exists but is not a kommit topic; remove it first");
+                }
+            }
+            meta::append(&store, &event, now_ms())
+        })
+        .await??;
         self.open_partitions(name, partitions).await
     }
 }
