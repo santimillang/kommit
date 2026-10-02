@@ -240,9 +240,14 @@ externally created branches; `git merge` for topics.
 - An offset list names every partition exactly once. Numbers with a leading zero do not
   count as offsets, so `12:00` is rejected rather than read as partition 12.
 - `num_partitions` must be -1 or the source's count.
-- Every problem with a branch request is `INVALID_CONFIG` with a message saying what is
+- Every problem with the branch configs is `INVALID_CONFIG` with a message saying what is
   wrong, including an unknown source and an unknown `kommit.*` config. Other configs are
-  still ignored.
+  still ignored. A bad or taken topic name keeps its usual code, and a faulted source
+  partition is `KAFKA_STORAGE_ERROR`: it cannot be forked until a restart.
+- A fork checks that every fork point lies on its root topic's history before anything is
+  recorded. If the branches fail to open after the meta commit, the name stays taken
+  until a restart, which finishes the fork from the recorded SHAs.
+- Forking holds no broker-wide lock: the new name is reserved while history is walked.
 - `BranchTopic { name, topic_id, from, root, at, heads }`: `heads` are the fork-point SHAs and
   are authoritative on replay, so a crash between the meta commit and the refs is repaired
   at the right commits. `root` is the topic whose sentinels the branches start at, which

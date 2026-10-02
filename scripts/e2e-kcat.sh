@@ -65,8 +65,9 @@ lag="$(git --git-dir="$WORK/data.git" rev-list --count refs/groups/e2e-group/ord
 
 # Branching (M3): fork at a timestamp, replay the fork with a fresh group, diverge it.
 printf 'old1\nold2\n' | "$KCAT" -b "$BROKER" -P -t events -p 0
+# Whole seconds keep `date` portable; the sleeps put the cut strictly between the batches.
 sleep 1.1
-cut="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
+cut="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 sleep 1.1
 printf 'new1\n' | "$KCAT" -b "$BROKER" -P -t events -p 0
 "$BIN" branch --bootstrap "$BROKER" --at "$cut" events events-replay
