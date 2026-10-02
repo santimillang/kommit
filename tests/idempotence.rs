@@ -11,6 +11,10 @@ use kafka_protocol::records::{
 
 /// One idempotent batch from producer `pid` with consecutive sequences starting at `first_seq`.
 fn idempotent_batch(pid: i64, first_seq: i32, values: &[&str]) -> Bytes {
+    batch_at_epoch(pid, 0, first_seq, values)
+}
+
+fn batch_at_epoch(pid: i64, epoch: i16, first_seq: i32, values: &[&str]) -> Bytes {
     let records: Vec<Record> = values
         .iter()
         .enumerate()
@@ -20,7 +24,7 @@ fn idempotent_batch(pid: i64, first_seq: i32, values: &[&str]) -> Bytes {
             delete_horizon: false,
             partition_leader_epoch: 0,
             producer_id: pid,
-            producer_epoch: 0,
+            producer_epoch: epoch,
             timestamp_type: TimestampType::Creation,
             offset: i as i64,
             sequence: first_seq + i as i32,
@@ -106,4 +110,40 @@ async fn retried_batches_are_stored_once_and_gaps_are_refused() {
     // a different producer has its own sequence space
     let other = c.send(9, send(idempotent_batch(8, 0, &["x"]))).await;
     assert_eq!(p(&other), (0, 3));
+}
+
+#[tokio::test]
+async fn a_bumped_epoch_restarts_sequences_and_stale_epochs_are_fenced() {
+    let (addr, broker) = common::start_mem_broker().await;
+    broker.create_topic("orders", 1).await.unwrap();
+    let mut c = common::TestClient::connect(addr).await;
+    let send = |batch| common::produce_req("orders", 0, batch, -1);
+    let p = |r: &kafka_protocol::messages::ProduceResponse| {
+        let p = &r.responses[0].partition_responses[0];
+        (p.error_code, p.base_offset)
+    };
+
+    assert_eq!(
+        p(&c.send(9, send(batch_at_epoch(7, 0, 0, &["a", "b"]))).await),
+        (0, 0)
+    );
+    // KIP-360: after a failure the producer bumps its epoch locally and restarts at 0.
+    // These are new records, not a retry of the epoch-0 batch with the same sequence.
+    assert_eq!(
+        p(&c.send(9, send(batch_at_epoch(7, 1, 0, &["c"]))).await),
+        (0, 2)
+    );
+    let log = broker.topic("orders").await.unwrap().partitions[0].clone();
+    assert_eq!(log.high_watermark(), 3);
+    // a new epoch must start at sequence 0
+    assert_eq!(
+        p(&c.send(9, send(batch_at_epoch(7, 2, 4, &["x"]))).await).0,
+        ResponseError::OutOfOrderSequenceNumber.code()
+    );
+    // the old epoch is fenced
+    assert_eq!(
+        p(&c.send(9, send(batch_at_epoch(7, 0, 2, &["z"]))).await).0,
+        ResponseError::InvalidProducerEpoch.code()
+    );
+    assert_eq!(log.high_watermark(), 3);
 }

@@ -44,6 +44,7 @@ pub fn decode_batches(bytes: Bytes) -> Result<Vec<(Offset, Record)>> {
 pub struct ProducedBatch {
     /// -1 when the producer is not idempotent.
     pub producer_id: i64,
+    pub producer_epoch: i16,
     pub first_sequence: i32,
     pub last_sequence: i32,
     pub records: Vec<Record>,
@@ -59,10 +60,12 @@ pub fn decode_produce_batches(bytes: Bytes) -> Result<Vec<ProducedBatch>> {
             let records: Vec<KafkaRecord> =
                 set.records.into_iter().filter(|r| !r.control).collect();
             let first = records.first()?;
-            let (producer_id, first_sequence) = (first.producer_id, first.sequence);
+            let (producer_id, producer_epoch, first_sequence) =
+                (first.producer_id, first.producer_epoch, first.sequence);
             let last_sequence = records.last().map_or(first_sequence, |r| r.sequence);
             Some(ProducedBatch {
                 producer_id,
+                producer_epoch,
                 first_sequence,
                 last_sequence,
                 records: records.into_iter().map(|r| from_kafka(r).1).collect(),
