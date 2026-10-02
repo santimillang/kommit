@@ -40,7 +40,7 @@ fn expected_forms(s: &str) -> String {
 impl BranchAt {
     pub fn parse(s: &str) -> Result<Self, String> {
         let s = s.trim();
-        if s == "head" {
+        if s.eq_ignore_ascii_case("head") {
             return Ok(BranchAt::Head);
         }
         if let Some(offsets) = parse_offsets(s)? {
@@ -204,6 +204,7 @@ mod tests {
     fn parses_head_offsets_and_timestamps() {
         assert_eq!(BranchAt::parse("head").unwrap(), BranchAt::Head);
         assert_eq!(BranchAt::parse(" head ").unwrap(), BranchAt::Head);
+        assert_eq!(BranchAt::parse("HEAD").unwrap(), BranchAt::Head);
         assert_eq!(BranchAt::parse("0:42").unwrap(), offsets(&[(0, 42)]));
         assert_eq!(
             BranchAt::parse("0:42, 1:17").unwrap(),
