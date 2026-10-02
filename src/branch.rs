@@ -37,11 +37,13 @@ pub enum BranchGroups {
 
 impl BranchGroups {
     pub fn parse(s: &str) -> Result<Self, String> {
+        // Group ids are case-sensitive, so only the lowercase words are keywords: a group
+        // called `ALL` can still be named. Ids containing ',' cannot be listed.
         let s = s.trim();
-        if s.eq_ignore_ascii_case("none") {
+        if s == "none" {
             return Ok(BranchGroups::None);
         }
-        if s.eq_ignore_ascii_case("all") {
+        if s == "all" {
             return Ok(BranchGroups::All);
         }
         let mut names: Vec<String> = Vec::new();
@@ -277,7 +279,9 @@ pub async fn resolve_groups(
                 });
             }
         }
-        if !found {
+        // `all` takes what resolves; a ref pointing outside its partition (after a hand
+        // rewind) is skipped. A named group was asked for, so it must have an offset.
+        if !found && matches!(groups, BranchGroups::Named(_)) {
             return Err(ResolveError::Invalid(format!(
                 "{BRANCH_GROUPS}: group {group} has no committed offsets on the source topic"
             )));
@@ -373,7 +377,12 @@ mod tests {
                 .map(|s| s.unwrap().groups)
         };
         assert_eq!(groups("none").unwrap(), BranchGroups::None);
-        assert_eq!(groups("ALL").unwrap(), BranchGroups::All);
+        assert_eq!(groups("all").unwrap(), BranchGroups::All);
+        // group ids are case-sensitive, so only the lowercase keywords are keywords
+        assert_eq!(
+            groups("ALL").unwrap(),
+            BranchGroups::Named(vec!["ALL".into()])
+        );
         assert_eq!(
             groups("billing, audit").unwrap(),
             BranchGroups::Named(vec!["billing".into(), "audit".into()])
@@ -497,6 +506,43 @@ mod tests {
             Err(ResolveError::Invalid(msg)) => assert!(msg.contains("ghost"), "{msg}"),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn all_skips_a_group_whose_ref_points_outside_the_partition() {
+        use crate::git::store::GitStore;
+        use crate::log::git::GitLog;
+        let dir = tempfile::tempdir().unwrap();
+        let s = Arc::new(GitStore::open_or_init(&dir.path().join("d.git")).unwrap());
+        let log = GitLog::open_or_create(s.clone(), "orders", 0)
+            .await
+            .unwrap();
+        log.append("app", vec![Record::text(1, "a")]).await.unwrap();
+        log.commit_offset("good", 1).await.unwrap();
+        log.commit_offset("lost", 1).await.unwrap();
+        // "lost" now points at another topic's commit, as after a hand rewind
+        drop(
+            GitLog::open_or_create(s.clone(), "payments", 0)
+                .await
+                .unwrap(),
+        );
+        let foreign = s.ref_target("refs/heads/payments/0").unwrap().unwrap();
+        s.set_ref("refs/groups/lost/orders/0", foreign, "test")
+            .unwrap();
+
+        let source = vec![Arc::new(log) as Arc<dyn PartitionLog>];
+        assert_eq!(
+            resolve_groups(&BranchGroups::All, &source, &[1])
+                .await
+                .unwrap(),
+            vec![go("good", 0, 1)]
+        );
+        // naming it is still an error: it was asked for and cannot be honoured
+        let named = BranchGroups::Named(vec!["lost".into()]);
+        assert!(matches!(
+            resolve_groups(&named, &source, &[1]).await,
+            Err(ResolveError::Invalid(_))
+        ));
     }
 
     #[tokio::test]
