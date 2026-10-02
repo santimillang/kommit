@@ -247,7 +247,9 @@ externally created branches; `git merge` for topics.
 - A fork checks that every fork point lies on its root topic's history before anything is
   recorded. If the branches fail to open after the meta commit, the name stays taken
   until a restart, which finishes the fork from the recorded SHAs.
-- Forking holds no broker-wide lock: the new name is reserved while history is walked.
+- Forking holds no broker-wide lock. Fork points are resolved first, then the new name is
+  reserved while the fork is written; creates, branches and validate-only requests for a
+  reserved name get `TOPIC_ALREADY_EXISTS`.
 - `BranchTopic { name, topic_id, from, root, at, heads }`: `heads` are the fork-point SHAs and
   are authoritative on replay, so a crash between the meta commit and the refs is repaired
   at the right commits. `root` is the topic whose sentinels the branches start at, which
@@ -275,10 +277,20 @@ kommit branch orders orders-replay --at 0:42 --groups billing,audit   # or: all
 - Zero copy again: for *c* ≤ *n* the fork's `refs/groups/<g>/<fork>/<p>` points at the same
   commit as the source's ref, and `git rev-list --count` measures the fork's lag.
 - A listed group with no committed offset on any source partition is `INVALID_CONFIG`.
+  `all` takes every group whose offset resolves, and skips one whose ref points outside
+  its partition (after a hand rewind).
+- `none` and `all` are keywords only in lowercase, since group ids are case-sensitive; a
+  group whose id contains `,` cannot be listed. `kommit branch` sends the setting only
+  when `--groups` is given, so plain forks work with brokers from before it.
+- The group offsets are a snapshot taken with the fork points: commits that land while
+  the fork is written are not carried over.
 - `BranchTopic` gains `group_offsets: [{ group, partition, offset }]` (empty when absent, so
   older events still load). At startup a recorded group offset whose ref is missing is
   written; one that exists is left alone, because the group may have committed on the fork
-  since. That repairs a crash between the meta commit and the group refs.
+  since. That repairs a crash between the meta commit and the group refs. It also means
+  that deleting a fork's group ref by hand is undone at the next start. A recorded offset
+  past a fork's head (the fork was rewound by hand) is skipped with a warning, never a
+  failed startup.
 - Groups are not otherwise copied: membership is never persisted, so a group appears on
   the fork as soon as a consumer joins it.
 
