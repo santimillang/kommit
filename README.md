@@ -71,6 +71,23 @@ git --git-dir demo.git rev-list --count refs/groups/billing/orders/0..orders/0  
 git --git-dir demo.git push --all <your-remote>                    # your topics, now on GitHub
 ```
 
+## Branching topics
+
+A topic forks like a branch: same commits, same SHAs, same offsets, nothing copied.
+
+```bash
+cargo run -- branch --bootstrap 127.0.0.1:9092 --at 2026-10-01T12:00:00Z orders orders-replay
+# or --at 0:42,1:17 (an offset per partition), or --at head (the default)
+
+kcat -b 127.0.0.1:9092 -G replay -X auto.offset.reset=earliest orders-replay   # replay the past
+git --git-dir demo.git merge-base orders/0 orders-replay/0                    # where they forked
+```
+
+Under the hood it is a `CreateTopics` request with the configs `kommit.branch.from` and
+`kommit.branch.at`, so any Admin client can do it (Java `Admin#createTopics`, librdkafka).
+`kafka-topics.sh` cannot: it rejects config names it does not know before sending anything.
+Writes to the fork diverge it and never touch the source.
+
 ## Things you can now do to a message queue
 
 - `git log` your event stream, with the producer's client id as the author
@@ -84,7 +101,7 @@ git --git-dir demo.git push --all <your-remote>                    # your topics
 |---|---|---|
 | M1 | Produce, Fetch (long polling), Metadata, CreateTopics, ListOffsets, ApiVersions | done |
 | M2 | Consumer groups (classic protocol), committed offsets as refs, idempotent producers | done |
-| M3 | Topic branching: fork a topic at an offset with `git branch`, zero copy | next |
+| M3 | Topic branching: fork a topic at an offset or a timestamp, zero copy | done |
 
 Single broker, plaintext only, no transactions, no durability guarantees, no retention.
 Please do not put it in production. It will let you, and it will work.

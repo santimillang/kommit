@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Real-client check: kcat (librdkafka) produces, the broker restarts, kcat consumes,
-# and plain git sees the topic. Requires: kcat, git, cargo.
+# a topic is branched and replayed, and plain git sees it all. Requires: kcat, git, cargo.
 # Set KCAT to use a kcat/kafkacat binary that is not on PATH as `kcat`.
 set -euo pipefail
 
@@ -62,5 +62,27 @@ timeout 60 "$KCAT" -b "$BROKER" -G e2e-group -X auto.offset.reset=earliest -c 3 
 [ "$(cat "$WORK/group.out")" = "$want" ] || { echo "group consume mismatch:"; cat "$WORK/group.out"; exit 1; }
 lag="$(git --git-dir="$WORK/data.git" rev-list --count refs/groups/e2e-group/orders/0..orders/0)"
 [ "$lag" = "0" ] || { echo "expected lag 0, git says $lag"; exit 1; }
+
+# Branching (M3): fork at a timestamp, replay the fork with a fresh group, diverge it.
+printf 'old1\nold2\n' | "$KCAT" -b "$BROKER" -P -t events -p 0
+sleep 1.1
+cut="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
+sleep 1.1
+printf 'new1\n' | "$KCAT" -b "$BROKER" -P -t events -p 0
+"$BIN" branch --bootstrap "$BROKER" --at "$cut" events events-replay
+
+got="$("$KCAT" -b "$BROKER" -C -t events-replay -p 0 -o beginning -e -q)"
+[ "$got" = $'old1\nold2' ] || { echo "fork replay mismatch:"; echo "$got"; exit 1; }
+timeout 60 "$KCAT" -b "$BROKER" -G replay-group -X auto.offset.reset=earliest -c 2 -q events-replay >"$WORK/replay.out"
+[ "$(cat "$WORK/replay.out")" = $'old1\nold2' ] || { echo "fork group mismatch:"; cat "$WORK/replay.out"; exit 1; }
+
+printf 'diverged\n' | "$KCAT" -b "$BROKER" -P -t events-replay -p 0
+got="$("$KCAT" -b "$BROKER" -C -t events -p 0 -o beginning -e -q)"
+[ "$got" = $'old1\nold2\nnew1' ] || { echo "source changed:"; echo "$got"; exit 1; }
+
+g() { git --git-dir="$WORK/data.git" "$@"; }
+[ "$(g rev-parse events-replay/0~1)" = "$(g rev-parse events/0~1)" ] || { echo "fork does not share commits"; exit 1; }
+[ "$(g merge-base events/0 events-replay/0)" = "$(g rev-parse events/0~1)" ] || { echo "unexpected merge base"; exit 1; }
+g fsck --strict --no-dangling
 
 echo "e2e-kcat: OK"

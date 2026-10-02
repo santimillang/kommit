@@ -209,12 +209,13 @@ scope.
 
 ## 7. Branching topics (M3)
 
-A fork is requested through the normal `CreateTopics` API, so any Kafka admin tool works:
+A fork is requested through the normal `CreateTopics` API, with the configs
+`kommit.branch.from` and `kommit.branch.at`, so any Admin client can make one (Java
+`Admin#createTopics`, librdkafka). `kafka-topics.sh` cannot (see §7.1). kommit's own CLI:
 
 ```
-kafka-topics.sh --create --topic orders-replay \
-  --config kommit.branch.from=orders \
-  --config kommit.branch.at=2026-10-01T12:00:00Z   # or: 0:42,1:17   or: head
+kommit branch --bootstrap localhost:9092 orders orders-replay \
+  --at 2026-10-01T12:00:00Z   # or: 0:42,1:17   or: head
 ```
 
 `at` accepts an RFC 3339 timestamp (resolved per partition like `ListOffsets`), an explicit
@@ -226,6 +227,31 @@ source. `kommit branch <from> <to> --at <spec>` is a thin CLI over the same API.
 
 Stretch, not committed: forking consumer-group offsets along with the topic; adopting
 externally created branches; `git merge` for topics.
+
+### 7.1 As built in M3
+
+- `kafka-topics.sh --config kommit.branch.from=…` cannot work: Kafka's `TopicCommand` runs
+  `LogConfig.validateNames` and refuses unknown config names before sending anything. The
+  CI pins this, so the docs notice if Kafka relaxes it.
+- Fork point *n* means the fork shares records `0..n` and starts with high watermark *n*;
+  any *n* in `0..=high_watermark` is allowed. A timestamp *T* forks each partition at its
+  first record with timestamp `>= T`, or at the head when there is none. `head` is the
+  default when `at` is omitted.
+- An offset list names every partition exactly once. Numbers with a leading zero do not
+  count as offsets, so `12:00` is rejected rather than read as partition 12.
+- `num_partitions` must be -1 or the source's count.
+- Every problem with a branch request is `INVALID_CONFIG` with a message saying what is
+  wrong, including an unknown source and an unknown `kommit.*` config. Other configs are
+  still ignored.
+- `BranchTopic { name, topic_id, from, root, at, heads }`: `heads` are the fork-point SHAs and
+  are authoritative on replay, so a crash between the meta commit and the refs is repaired
+  at the right commits. `root` is the topic whose sentinels the branches start at, which
+  for a fork of a fork is the original topic.
+- Fork points are read from the source's branches in Git, not from memory.
+- Consumer-group offsets are not forked: a group on the fork starts from
+  `auto.offset.reset`, and its lag is still `git rev-list --count`.
+- Real clients are tested in CI: kcat forks at a timestamp, replays the fork in a fresh group
+  and diverges it; a Java console consumer group replays a fork made by `kommit branch`.
 
 ## 8. Error handling
 
@@ -263,7 +289,7 @@ TDD throughout: failing test first, then the minimal implementation.
 | **M0** skeleton | Crate layout, CI, framing, `ApiVersions` | `kcat -L` gets an `ApiVersions` answer |
 | **M1** kcat on Git | `Metadata`, `CreateTopics`, `Produce`, `Fetch`, `ListOffsets`, `GitLog`, meta log, startup rebuild | `kcat` produce → restart → consume; `git log orders/0`; `git push --all` to GitHub |
 | **M2** consumer groups | Offset commit/fetch, group coordination, `InitProducerId`, `ListGroups`/`DescribeGroups` | Two Java console consumers share a group; `kafka-consumer-groups.sh` lag equals `git rev-list --count` |
-| **M3** branching | `CreateTopics` with `kommit.branch.*`, `kommit branch` CLI | Fork `orders` at a timestamp, replay the fork with a fresh consumer, diverge it |
+| **M3** branching | `CreateTopics` with `kommit.branch.*`, `kommit branch` CLI | `kommit branch` forks `orders` at a timestamp, a fresh consumer replays the fork, the fork diverges |
 
 ## 11. Workflow
 

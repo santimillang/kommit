@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Real Java clients against kommit, in Docker: kafka-topics creates a topic, the console
 # producer (idempotent by default) writes to it, a console consumer group reads it and
-# commits, kafka-consumer-groups reports the lag, and plain git agrees on the host.
+# commits, kafka-consumer-groups reports the lag, and plain git agrees on the host. Then
+# `kommit branch` forks the topic and a fresh Java consumer group replays the fork.
 # Requires: docker, git, cargo. KAFKA_IMAGE picks the Kafka tools image.
 set -euo pipefail
 
@@ -75,6 +76,30 @@ echo "$describe" | awk '$1 == "java-group" && $2 == "orders" { if ($6 != "0") ba
 for p in 0 1; do
   lag="$(git --git-dir="$WORK/data/kommit.git" rev-list --count "refs/groups/java-group/orders/$p..orders/$p")"
   [ "$lag" = "0" ] || { echo "git lag on partition $p: $lag"; exit 1; }
+done
+
+# Branching (M3). kafka-topics.sh validates config names client-side
+# (LogConfig.validateNames), so it can never send kommit.branch.*: pin that.
+if out="$(kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server "$BOOTSTRAP" --create \
+    --topic orders-replay --config kommit.branch.from=orders 2>&1)"; then
+  echo "kafka-topics.sh accepted kommit.branch.from; update the docs"; exit 1
+fi
+echo "$out" | grep -q "Unknown topic config name: kommit.branch.from" \
+  || { echo "unexpected kafka-topics.sh failure: $out"; exit 1; }
+
+# The kommit CLI branches over the Admin API, and a fresh Java group replays the fork.
+docker run --rm --network "$NET" --user "$(id -u):$(id -g)" \
+  -v "$ROOT/target/debug/kommit:/kommit:ro" ubuntu:24.04 \
+  /kommit branch --bootstrap "$BOOTSTRAP" orders orders-replay
+got="$(kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server "$BOOTSTRAP" \
+  --topic orders-replay --group replay-group --from-beginning \
+  --consumer-property group.protocol=classic \
+  --max-messages 12 --timeout-ms 60000 | sort -n | tr '\n' ' ')"
+[ "$got" = "1 2 3 4 5 6 7 8 9 10 11 12 " ] || { echo "fork replay got: $got"; exit 1; }
+d="$WORK/data/kommit.git"
+for p in 0 1; do
+  [ "$(git --git-dir="$d" rev-parse "orders-replay/$p")" = "$(git --git-dir="$d" rev-parse "orders/$p")" ] \
+    || { echo "fork partition $p does not share the source head"; exit 1; }
 done
 
 echo "e2e-java: OK"
