@@ -168,6 +168,64 @@ async fn git_broker(path: &std::path::Path) -> Arc<Broker> {
 }
 
 #[tokio::test]
+async fn a_branch_can_take_consumer_groups_along() {
+    let (addr, broker) = common::start_mem_broker().await;
+    broker.create_topic("orders", 1).await.unwrap();
+    let mut c = common::TestClient::connect(addr).await;
+    produce(&mut c, "orders", 0, &[(1, "a"), (2, "b"), (3, "c")]).await;
+    let orders = broker.topic("orders").await.unwrap();
+    orders.partitions[0]
+        .commit_offset("billing", 1)
+        .await
+        .unwrap();
+    orders.partitions[0]
+        .commit_offset("audit", 3)
+        .await
+        .unwrap();
+
+    let with_groups = |name: &str, groups: &str| {
+        let mut req = common::branch_topic_req(name, "orders", Some("0:2"));
+        req.topics[0].configs.push(
+            CreatableTopicConfig::default()
+                .with_name(StrBytes::from_static_str("kommit.branch.groups"))
+                .with_value(Some(StrBytes::from_string(groups.to_string()))),
+        );
+        req
+    };
+    let committed = |t: Arc<TopicState>, g: &'static str| async move {
+        t.partitions[0].committed_offset(g).await.unwrap()
+    };
+
+    assert_eq!(
+        c.send(7, with_groups("all", "all")).await.topics[0].error_code,
+        0
+    );
+    let all = broker.topic("all").await.unwrap();
+    assert_eq!(committed(all.clone(), "billing").await, Some(1));
+    // audit had read past the fork point (2): caught up on the fork
+    assert_eq!(committed(all, "audit").await, Some(2));
+
+    assert_eq!(
+        c.send(7, with_groups("one", "billing")).await.topics[0].error_code,
+        0
+    );
+    let one = broker.topic("one").await.unwrap();
+    assert_eq!(committed(one.clone(), "billing").await, Some(1));
+    assert_eq!(committed(one, "audit").await, None);
+
+    // the default takes none
+    assert_eq!(branch(&mut c, "plain", "orders", None).await.0, 0);
+    let plain = broker.topic("plain").await.unwrap();
+    assert_eq!(committed(plain, "billing").await, None);
+
+    let r = c.send(7, with_groups("ghost", "billing,ghost")).await;
+    assert_eq!(r.topics[0].error_code, INVALID_CONFIG);
+    let msg = r.topics[0].error_message.as_ref().unwrap().to_string();
+    assert!(msg.contains("ghost"), "{msg}");
+    assert!(broker.topic("ghost").await.is_none());
+}
+
+#[tokio::test]
 async fn forks_of_forks_survive_a_restart_and_share_commits() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("data.git");

@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+pub use crate::git::meta::GroupOffset;
 use crate::log::{LogError, PartitionLog};
 use crate::record::Offset;
 
@@ -238,6 +239,53 @@ pub async fn resolve(
     }
 }
 
+/// The committed offsets a fork takes along: per chosen group and source partition p
+/// with a commit `c`, `min(c, at[p])`. A group that had read past the fork point is
+/// caught up on the fork. Sorted by group, then partition.
+pub async fn resolve_groups(
+    groups: &BranchGroups,
+    source: &[Arc<dyn PartitionLog>],
+    at: &[Offset],
+) -> Result<Vec<GroupOffset>, ResolveError> {
+    let names: Vec<String> = match groups {
+        BranchGroups::None => return Ok(Vec::new()),
+        BranchGroups::All => {
+            let mut all = Vec::new();
+            for log in source {
+                all.extend(log.committed_groups().await?);
+            }
+            all.sort();
+            all.dedup();
+            all
+        }
+        BranchGroups::Named(names) => {
+            let mut names = names.clone();
+            names.sort();
+            names
+        }
+    };
+    let mut out = Vec::new();
+    for group in names {
+        let mut found = false;
+        for (p, (log, &n)) in source.iter().zip(at).enumerate() {
+            if let Some(c) = log.committed_offset(&group).await? {
+                found = true;
+                out.push(GroupOffset {
+                    group: group.clone(),
+                    partition: p as i32,
+                    offset: c.min(n),
+                });
+            }
+        }
+        if !found {
+            return Err(ResolveError::Invalid(format!(
+                "{BRANCH_GROUPS}: group {group} has no committed offsets on the source topic"
+            )));
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,6 +458,44 @@ mod tests {
                 Err(ResolveError::Invalid(msg)) => assert!(msg.contains(needle), "{msg}"),
                 other => panic!("{needle}: got {other:?}"),
             }
+        }
+    }
+
+    fn go(group: &str, partition: i32, offset: Offset) -> GroupOffset {
+        GroupOffset {
+            group: group.into(),
+            partition,
+            offset,
+        }
+    }
+
+    #[tokio::test]
+    async fn resolves_group_offsets_within_the_fork_points() {
+        let source = vec![log_with(&[1, 2, 3]).await, log_with(&[1, 2]).await];
+        source[0].commit_offset("billing", 3).await.unwrap();
+        source[1].commit_offset("billing", 1).await.unwrap();
+        source[1].commit_offset("audit", 2).await.unwrap();
+        // fork points: partition 0 shares 2 records, partition 1 shares 2
+        let at = [2, 2];
+
+        let none = resolve_groups(&BranchGroups::None, &source, &at).await;
+        assert_eq!(none.unwrap(), vec![]);
+        // billing had read past partition 0's fork point: caught up on the fork
+        assert_eq!(
+            resolve_groups(&BranchGroups::All, &source, &at)
+                .await
+                .unwrap(),
+            vec![go("audit", 1, 2), go("billing", 0, 2), go("billing", 1, 1)]
+        );
+        let named = BranchGroups::Named(vec!["billing".into()]);
+        assert_eq!(
+            resolve_groups(&named, &source, &at).await.unwrap(),
+            vec![go("billing", 0, 2), go("billing", 1, 1)]
+        );
+        let unknown = BranchGroups::Named(vec!["billing".into(), "ghost".into()]);
+        match resolve_groups(&unknown, &source, &at).await {
+            Err(ResolveError::Invalid(msg)) => assert!(msg.contains("ghost"), "{msg}"),
+            other => panic!("{other:?}"),
         }
     }
 

@@ -270,12 +270,17 @@ impl Broker {
                 "a branch has its source's {count} partition(s); omit the partition count or pass {count}"
             )));
         }
+        let resolve_error = |e| match e {
+            ResolveError::Invalid(msg) => CreateTopicError::InvalidConfig(msg),
+            ResolveError::Log(e) => CreateTopicError::Storage(e.to_string()),
+        };
         let at = branch::resolve(&spec.at, &source.partitions)
             .await
-            .map_err(|e| match e {
-                ResolveError::Invalid(msg) => CreateTopicError::InvalidConfig(msg),
-                ResolveError::Log(e) => CreateTopicError::Storage(e.to_string()),
-            })?;
+            .map_err(resolve_error)?;
+        // A snapshot: commits that land while the fork is written are not carried over.
+        let groups = branch::resolve_groups(&spec.groups, &source.partitions, &at)
+            .await
+            .map_err(resolve_error)?;
         if validate_only {
             return Ok((count, None));
         }
@@ -290,8 +295,6 @@ impl Broker {
                 name,
             }
         };
-        // Which groups come along is resolved in the next step (spec §7.2).
-        let groups: Vec<crate::git::meta::GroupOffset> = Vec::new();
         let topic_id = Uuid::new_v4();
         let logs = match self
             .storage
