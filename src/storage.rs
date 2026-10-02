@@ -133,7 +133,9 @@ impl GitStorage {
         let mut logs: Vec<Arc<dyn PartitionLog>> = Vec::with_capacity(partitions as usize);
         for p in 0..partitions {
             logs.push(Arc::new(
-                GitLog::open_or_create(self.store.clone(), name, p).await?,
+                GitLog::open_or_create(self.store.clone(), name, p)
+                    .await
+                    .with_context(|| format!("opening partition {name}/{p}"))?,
             ));
         }
         Ok(logs)
@@ -154,7 +156,9 @@ impl GitStorage {
                 at,
             };
             logs.push(Arc::new(
-                GitLog::open(self.store.clone(), name, p as i32, origin).await?,
+                GitLog::open(self.store.clone(), name, p as i32, origin)
+                    .await
+                    .with_context(|| format!("opening fork {name}/{p}"))?,
             ));
         }
         Ok(logs)
@@ -493,6 +497,31 @@ mod tests {
         }
         let loaded = open(&path).load().await.unwrap();
         assert!(loaded.topics.iter().all(|t| t.name != "replay"));
+    }
+
+    #[tokio::test]
+    async fn a_fork_that_cannot_be_opened_is_named_at_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.git");
+        {
+            let store = GitStore::open_or_init(&path).unwrap();
+            let missing = "ab".repeat(20);
+            meta::append(
+                &store,
+                &MetaEvent::BranchTopic {
+                    name: "replay".into(),
+                    topic_id: Uuid::new_v4(),
+                    from: "orders".into(),
+                    root: "orders".into(),
+                    at: vec![0],
+                    heads: vec![missing],
+                },
+                now_ms(),
+            )
+            .unwrap();
+        }
+        let err = open(&path).load().await.err().unwrap();
+        assert!(format!("{err:#}").contains("replay/0"), "{err:#}");
     }
 
     #[tokio::test]
