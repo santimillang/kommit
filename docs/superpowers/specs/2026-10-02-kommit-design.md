@@ -253,10 +253,34 @@ externally created branches; `git merge` for topics.
   at the right commits. `root` is the topic whose sentinels the branches start at, which
   for a fork of a fork is the original topic.
 - Fork points are read from the source's branches in Git, not from memory.
-- Consumer-group offsets are not forked: a group on the fork starts from
-  `auto.offset.reset`, and its lag is still `git rev-list --count`.
+- Consumer-group offsets are not forked unless asked for (§7.2): by default a group on the
+  fork starts from `auto.offset.reset`, and its lag is still `git rev-list --count`.
 - Real clients are tested in CI: kcat forks at a timestamp, replays the fork in a fresh group
   and diverges it; a Java console consumer group replays a fork made by `kommit branch`.
+
+### 7.2 Forking consumer-group offsets
+
+A fork can take groups' committed offsets with it, so a consumer resumes on the fork where
+it was on the source:
+
+```
+kommit branch orders orders-replay --at 0:42 --groups billing,audit   # or: all
+```
+
+- The config is `kommit.branch.groups`: `none` (the default), `all` (every group with a
+  committed offset on any source partition), or a comma-separated list of group ids.
+- Per partition p with fork point *n*, a group whose committed offset on the source is *c*
+  gets `min(c, n)` on the fork. A group that had read past the fork point is caught up on
+  the fork. A group with no commit on p gets none on the fork's p.
+- Zero copy again: for *c* ≤ *n* the fork's `refs/groups/<g>/<fork>/<p>` points at the same
+  commit as the source's ref, and `git rev-list --count` measures the fork's lag.
+- A listed group with no committed offset on any source partition is `INVALID_CONFIG`.
+- `BranchTopic` gains `group_offsets: [{ group, partition, offset }]` (empty when absent, so
+  older events still load). At startup a recorded group offset whose ref is missing is
+  written; one that exists is left alone, because the group may have committed on the fork
+  since. That repairs a crash between the meta commit and the group refs.
+- Groups are not otherwise copied: membership is never persisted, so a group appears on
+  the fork as soon as a consumer joins it.
 
 ## 8. Error handling
 
