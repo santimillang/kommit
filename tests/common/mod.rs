@@ -6,8 +6,9 @@ use std::sync::Arc;
 use bytes::{Bytes, BytesMut};
 use kafka_protocol::messages::create_topics_request::CreatableTopic;
 use kafka_protocol::messages::metadata_request::MetadataRequestTopic;
+use kafka_protocol::messages::produce_request::{PartitionProduceData, TopicProduceData};
 use kafka_protocol::messages::{
-    CreateTopicsRequest, MetadataRequest, RequestHeader, ResponseHeader, TopicName,
+    CreateTopicsRequest, MetadataRequest, ProduceRequest, RequestHeader, ResponseHeader, TopicName,
 };
 use kafka_protocol::protocol::{Decodable, Encodable, HeaderVersion, Request, StrBytes};
 use kommit::broker::Broker;
@@ -64,6 +65,21 @@ pub fn create_topic_req(name: &str, partitions: i32) -> CreateTopicsRequest {
                 .with_name(topic_name(name))
                 .with_num_partitions(partitions)
                 .with_replication_factor(-1),
+        ])
+}
+
+pub fn produce_req(topic: &str, partition: i32, batch: Bytes, acks: i16) -> ProduceRequest {
+    ProduceRequest::default()
+        .with_acks(acks)
+        .with_timeout_ms(5000)
+        .with_topic_data(vec![
+            TopicProduceData::default()
+                .with_name(topic_name(topic))
+                .with_partition_data(vec![
+                    PartitionProduceData::default()
+                        .with_index(partition)
+                        .with_records(Some(batch)),
+                ]),
         ])
 }
 
