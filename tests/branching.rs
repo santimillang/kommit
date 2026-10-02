@@ -240,10 +240,33 @@ async fn the_cli_library_branches_and_reports_fork_points() {
     let err = kommit::cli::branch(&addr.to_string(), "nope", "x", "head")
         .await
         .unwrap_err();
-    assert!(
-        format!("{err:#}").contains("nope does not exist"),
-        "{err:#}"
-    );
+    let msg = format!("{err:#}");
+    assert!(msg.contains("nope does not exist"), "{msg}");
+    assert!(msg.contains("InvalidConfig"), "{msg}");
+}
+
+#[tokio::test]
+async fn the_cli_client_gives_up_on_a_silent_broker() {
+    // accepts the connection, then never answers
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let _held = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        drop(socket);
+    });
+    let mut client = kommit::net::client::Client::connect(&addr.to_string())
+        .await
+        .unwrap()
+        .with_timeout(std::time::Duration::from_millis(200));
+    let started = std::time::Instant::now();
+    let err = client
+        .send(3, kafka_protocol::messages::ApiVersionsRequest::default())
+        .await
+        .err()
+        .unwrap();
+    assert!(format!("{err:#}").contains("timed out"), "{err:#}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
 }
 
 #[tokio::test]

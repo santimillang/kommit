@@ -1,6 +1,7 @@
 //! `kommit branch`: a thin client over CreateTopics with kommit.branch configs.
 
 use anyhow::{Result, bail};
+use kafka_protocol::ResponseError;
 use kafka_protocol::messages::create_topics_request::{CreatableTopic, CreatableTopicConfig};
 use kafka_protocol::messages::list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic};
 use kafka_protocol::messages::{BrokerId, CreateTopicsRequest, ListOffsetsRequest, TopicName};
@@ -35,16 +36,13 @@ pub async fn branch(bootstrap: &str, from: &str, to: &str, at: &str) -> Result<V
     let Some(result) = resp.topics.first() else {
         bail!("the broker answered without a result for {to}");
     };
-    if result.error_code != 0 {
+    if let Some(code) = ResponseError::try_from_code(result.error_code) {
         let msg = result
             .error_message
             .as_ref()
             .map(|m| m.to_string())
-            .unwrap_or_default();
-        bail!(
-            "branching {from} as {to} failed (error {}): {msg}",
-            result.error_code
-        );
+            .unwrap_or_else(|| code.to_string());
+        bail!("branching {from} as {to} failed with {code:?}: {msg}");
     }
     let req = ListOffsetsRequest::default()
         .with_replica_id(BrokerId(-1))
