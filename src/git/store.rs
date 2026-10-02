@@ -3,11 +3,34 @@
 
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use gix::ObjectId;
 use gix::refs::Target;
 use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit};
+
+/// How long to wait for the repository lock before assuming another broker owns it.
+const LOCK_WAIT: Duration = Duration::from_secs(2);
+
+/// flock locks belong to the open file description, which processes spawned at the
+/// same moment can briefly share, and a restarted broker can race its predecessor's
+/// exit. So a held lock is retried for LOCK_WAIT before it counts as a live broker.
+fn acquire_lock(path: &Path) -> std::io::Result<File> {
+    let deadline = Instant::now() + LOCK_WAIT;
+    loop {
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(path)?;
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            Err(e) => return Err(std::io::Error::other(e.to_string())),
+        }
+    }
+}
 
 pub struct GitStore {
     repo: gix::ThreadSafeRepository,
@@ -23,12 +46,7 @@ impl GitStore {
         } else {
             gix::init_bare(path).with_context(|| format!("creating {}", path.display()))?
         };
-        let lock = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(path.join("kommit.lock"))?;
-        lock.try_lock()
+        let lock = acquire_lock(&path.join("kommit.lock"))
             .map_err(|_| anyhow!("another kommit broker is using {}", path.display()))?;
         // Commits point at the empty tree, so it must exist for fsck.
         let empty_tree = repo.write_object(gix::objs::Tree::empty())?.detach();
@@ -128,6 +146,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = GitStore::open_or_init(&dir.path().join("data.git")).unwrap();
         (dir, store)
+    }
+
+    #[test]
+    fn a_briefly_held_lock_is_waited_for() {
+        let (dir, held) = store();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(held);
+        });
+        let started = std::time::Instant::now();
+        GitStore::open_or_init(&dir.path().join("data.git")).unwrap();
+        assert!(started.elapsed() >= std::time::Duration::from_millis(250));
+        releaser.join().unwrap();
     }
 
     #[test]
