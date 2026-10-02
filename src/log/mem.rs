@@ -28,6 +28,12 @@ impl PartitionLog for MemLog {
         Ok(self.committed.read().unwrap().get(group).copied())
     }
 
+    async fn committed_groups(&self) -> Result<Vec<String>, LogError> {
+        let mut groups: Vec<String> = self.committed.read().unwrap().keys().cloned().collect();
+        groups.sort();
+        Ok(groups)
+    }
+
     async fn append(&self, _producer: &str, records: Vec<Record>) -> Result<Offset, LogError> {
         let mut log = self.records.write().unwrap();
         let base = log.len() as Offset;

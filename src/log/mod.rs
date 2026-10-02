@@ -28,6 +28,8 @@ pub trait PartitionLog: Send + Sync {
     /// Any offset in `0..=high_watermark` is allowed, including moving backwards.
     async fn commit_offset(&self, group: &str, offset: Offset) -> Result<(), LogError>;
     async fn committed_offset(&self, group: &str) -> Result<Option<Offset>, LogError>;
+    /// Every group with a committed offset on this partition, sorted.
+    async fn committed_groups(&self) -> Result<Vec<String>, LogError>;
     fn high_watermark(&self) -> Offset;
     fn log_start(&self) -> Offset {
         0

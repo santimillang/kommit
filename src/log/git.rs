@@ -5,7 +5,7 @@ use gix::ObjectId;
 
 use crate::git::encode::{commit_to_record, record_to_commit, sentinel_commit, sentinel_of};
 use crate::git::store::GitStore;
-use crate::groups::group_ref_component;
+use crate::groups::{group_from_ref_component, group_ref_component};
 use crate::log::{LogError, MAX_READ_RECORDS, PartitionLog, take_within_limit};
 use crate::record::{Offset, Record, now_ms};
 
@@ -135,6 +135,25 @@ impl PartitionLog for GitLog {
         .await
         .map_err(storage)?
         .map_err(storage)
+    }
+
+    async fn committed_groups(&self) -> Result<Vec<String>, LogError> {
+        let store = self.store.clone();
+        let refs = tokio::task::spawn_blocking(move || store.refs_with_prefix("refs/groups/"))
+            .await
+            .map_err(storage)?
+            .map_err(storage)?;
+        // refs/groups/<group>/<topic>/<partition>; topic names never contain '/'
+        let suffix = format!("{}/{}", self.topic, self.partition);
+        let mut groups: Vec<String> = refs
+            .iter()
+            .filter_map(|(name, _)| {
+                let (component, rest) = name.strip_prefix("refs/groups/")?.split_once('/')?;
+                (rest == suffix).then(|| group_from_ref_component(component))?
+            })
+            .collect();
+        groups.sort();
+        Ok(groups)
     }
 
     async fn committed_offset(&self, group: &str) -> Result<Option<Offset>, LogError> {
@@ -418,6 +437,23 @@ mod tests {
             ],
         );
         assert_eq!(lag.trim(), "5");
+    }
+
+    #[tokio::test]
+    async fn committed_groups_only_lists_this_partition() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(&dir);
+        let open = |t: &'static str, p| GitLog::open_or_create(s.clone(), t, p);
+        let (p0, p1, other) = (
+            open("orders", 0).await.unwrap(),
+            open("orders", 1).await.unwrap(),
+            open("orders-x", 0).await.unwrap(),
+        );
+        p0.commit_offset("a", 0).await.unwrap();
+        p1.commit_offset("b", 0).await.unwrap();
+        other.commit_offset("c", 0).await.unwrap();
+        assert_eq!(p0.committed_groups().await.unwrap(), vec!["a".to_string()]);
+        assert_eq!(p1.committed_groups().await.unwrap(), vec!["b".to_string()]);
     }
 
     #[tokio::test]

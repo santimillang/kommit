@@ -64,4 +64,11 @@ pub async fn run_all(log: &dyn PartitionLog) {
     log.commit_offset("g", 0).await.unwrap();
     assert_eq!(log.committed_offset("g").await.unwrap(), Some(0));
     assert_eq!(log.committed_offset("other").await.unwrap(), None);
+
+    // the groups that have committed here, sorted, including ref-hostile ids
+    log.commit_offset("my group", 1).await.unwrap();
+    assert_eq!(
+        log.committed_groups().await.unwrap(),
+        vec!["g".to_string(), "my group".to_string()]
+    );
 }
