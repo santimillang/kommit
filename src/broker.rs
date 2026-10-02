@@ -290,6 +290,8 @@ impl Broker {
                 name,
             }
         };
+        // Which groups come along is resolved in the next step (spec §7.2).
+        let groups: Vec<crate::git::meta::GroupOffset> = Vec::new();
         let topic_id = Uuid::new_v4();
         let logs = match self
             .storage
@@ -300,6 +302,7 @@ impl Broker {
                 &source.root,
                 &source.partitions,
                 &at,
+                &groups,
             )
             .await
         {
@@ -395,11 +398,12 @@ mod tests {
             root: &str,
             source: &[Arc<dyn PartitionLog>],
             at: &[crate::record::Offset],
+            groups: &[crate::git::meta::GroupOffset],
         ) -> anyhow::Result<Vec<Arc<dyn PartitionLog>>> {
             self.entered.notify_one();
             self.release.notified().await;
             MemStorage
-                .branch_topic(name, topic_id, from, root, source, at)
+                .branch_topic(name, topic_id, from, root, source, at, groups)
                 .await
         }
         async fn allocate_producer_ids(&self, _up_to: i64) -> anyhow::Result<()> {
@@ -444,6 +448,7 @@ mod tests {
             _root: &str,
             _source: &[Arc<dyn PartitionLog>],
             _at: &[crate::record::Offset],
+            _groups: &[crate::git::meta::GroupOffset],
         ) -> anyhow::Result<Vec<Arc<dyn PartitionLog>>> {
             Err(recorded_failure())
         }

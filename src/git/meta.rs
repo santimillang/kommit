@@ -27,9 +27,21 @@ pub enum MetaEvent {
         root: String,
         at: Vec<i64>,
         heads: Vec<String>,
+        /// Committed offsets the fork took along (spec §7.2). Last, because TOML writes
+        /// arrays of tables after plain values; absent in events from before §7.2.
+        #[serde(default)]
+        group_offsets: Vec<GroupOffset>,
     },
     /// Producer ids below `up_to` may have been handed out; a restart resumes there.
     AllocateProducerIds { up_to: i64 },
+}
+
+/// A consumer group's committed offset on one partition of a fork.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GroupOffset {
+    pub group: String,
+    pub partition: i32,
+    pub offset: i64,
 }
 
 pub fn append(store: &GitStore, event: &MetaEvent, now_ms: i64) -> Result<()> {
@@ -94,6 +106,11 @@ mod tests {
             root: "orders".into(),
             at: vec![2, 0, 5],
             heads: vec!["a".repeat(40), "b".repeat(40), "c".repeat(40)],
+            group_offsets: vec![GroupOffset {
+                group: "my group".into(),
+                partition: 2,
+                offset: 5,
+            }],
         };
         {
             let store = GitStore::open_or_init(&path).unwrap();

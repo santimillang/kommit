@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use gix::ObjectId;
 use uuid::Uuid;
 
-use crate::git::meta::{self, MetaEvent};
+use crate::git::meta::{self, GroupOffset, MetaEvent};
 use crate::git::store::GitStore;
 use crate::groups::group_from_ref_component;
 use crate::log::PartitionLog;
@@ -48,7 +48,9 @@ pub trait Storage: Send + Sync {
     ) -> Result<Vec<Arc<dyn PartitionLog>>>;
     /// Creates `name` as a fork of `from`: partition p shares `from`'s first `at[p]`
     /// records. `root` is the topic `from`'s branches are rooted at. `source` holds
-    /// `from`'s logs, for storages that copy instead of sharing commits.
+    /// `from`'s logs, for storages that copy instead of sharing commits. `groups` are
+    /// committed offsets the fork starts with, each within its partition's fork point.
+    #[allow(clippy::too_many_arguments)]
     async fn branch_topic(
         &self,
         name: &str,
@@ -57,6 +59,7 @@ pub trait Storage: Send + Sync {
         root: &str,
         source: &[Arc<dyn PartitionLog>],
         at: &[Offset],
+        groups: &[GroupOffset],
     ) -> Result<Vec<Arc<dyn PartitionLog>>>;
     /// Durably records that producer ids below `up_to` may be in use.
     async fn allocate_producer_ids(&self, up_to: i64) -> Result<()>;
@@ -89,6 +92,22 @@ impl Storage for MemStorage {
         _root: &str,
         source: &[Arc<dyn PartitionLog>],
         at: &[Offset],
+        groups: &[GroupOffset],
+    ) -> Result<Vec<Arc<dyn PartitionLog>>> {
+        let logs = Self::copy_prefixes(source, at).await?;
+        apply_group_offsets(&logs, groups).await?;
+        Ok(logs)
+    }
+
+    async fn allocate_producer_ids(&self, _up_to: i64) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl MemStorage {
+    async fn copy_prefixes(
+        source: &[Arc<dyn PartitionLog>],
+        at: &[Offset],
     ) -> Result<Vec<Arc<dyn PartitionLog>>> {
         let mut logs: Vec<Arc<dyn PartitionLog>> = Vec::with_capacity(source.len());
         for (log, &n) in source.iter().zip(at) {
@@ -108,10 +127,26 @@ impl Storage for MemStorage {
         }
         Ok(logs)
     }
+}
 
-    async fn allocate_producer_ids(&self, _up_to: i64) -> Result<()> {
-        Ok(())
+/// Writes each group offset whose ref is missing. One that exists is left alone: the
+/// group may have committed on the fork since the offsets were recorded.
+async fn apply_group_offsets(logs: &[Arc<dyn PartitionLog>], groups: &[GroupOffset]) -> Result<()> {
+    for g in groups {
+        let log = usize::try_from(g.partition)
+            .ok()
+            .and_then(|p| logs.get(p))
+            .with_context(|| {
+                format!(
+                    "group {} has an offset for missing partition {}",
+                    g.group, g.partition
+                )
+            })?;
+        if log.committed_offset(&g.group).await?.is_none() {
+            log.commit_offset(&g.group, g.offset).await?;
+        }
     }
+    Ok(())
 }
 
 pub struct GitStorage {
@@ -169,13 +204,7 @@ impl GitStorage {
 impl Storage for GitStorage {
     async fn load(&self) -> Result<Loaded> {
         let store = self.store.clone();
-        let (events, group_refs) = tokio::task::spawn_blocking(move || -> Result<_> {
-            Ok((
-                meta::replay(&store)?,
-                store.refs_with_prefix("refs/groups/")?,
-            ))
-        })
-        .await??;
+        let events = tokio::task::spawn_blocking(move || meta::replay(&store)).await??;
         let mut loaded = Loaded::default();
         for event in events {
             match event {
@@ -197,6 +226,7 @@ impl Storage for GitStorage {
                     topic_id,
                     root,
                     heads,
+                    group_offsets,
                     ..
                 } => {
                     let heads = heads
@@ -208,6 +238,9 @@ impl Storage for GitStorage {
                         })
                         .collect::<Result<Vec<_>>>()?;
                     let partitions = self.open_forks(&name, &root, &heads).await?;
+                    apply_group_offsets(&partitions, &group_offsets)
+                        .await
+                        .with_context(|| format!("restoring group offsets on fork {name}"))?;
                     loaded.topics.push(LoadedTopic {
                         name,
                         topic_id,
@@ -220,6 +253,10 @@ impl Storage for GitStorage {
                 }
             }
         }
+        // Listed after the replay, which may have repaired group refs.
+        let store = self.store.clone();
+        let group_refs =
+            tokio::task::spawn_blocking(move || store.refs_with_prefix("refs/groups/")).await??;
         let mut groups: Vec<String> = group_refs
             .iter()
             .filter_map(|(name, _)| {
@@ -275,13 +312,15 @@ impl Storage for GitStorage {
         root: &str,
         _source: &[Arc<dyn PartitionLog>],
         at: &[Offset],
+        groups: &[GroupOffset],
     ) -> Result<Vec<Arc<dyn PartitionLog>>> {
         let store = self.store.clone();
-        let (topic, source, root_name, offsets) = (
+        let (topic, source, root_name, offsets, group_offsets) = (
             name.to_string(),
             from.to_string(),
             root.to_string(),
             at.to_vec(),
+            groups.to_vec(),
         );
         let heads = tokio::task::spawn_blocking(move || -> Result<Vec<ObjectId>> {
             let mut heads = Vec::with_capacity(offsets.len());
@@ -312,14 +351,20 @@ impl Storage for GitStorage {
                 root: root_name,
                 at: offsets,
                 heads: heads.iter().map(|h| h.to_string()).collect(),
+                group_offsets,
             };
             meta::append(&store, &event, now_ms())?;
             Ok(heads)
         })
         .await??;
-        self.open_forks(name, root, &heads)
+        let opened = async {
+            let logs = self.open_forks(name, root, &heads).await?;
+            apply_group_offsets(&logs, groups).await?;
+            Ok(logs)
+        };
+        opened
             .await
-            .map_err(|e| RecordedButNotOpened(e).into())
+            .map_err(|e: anyhow::Error| RecordedButNotOpened(e).into())
     }
 
     async fn allocate_producer_ids(&self, up_to: i64) -> Result<()> {
@@ -353,6 +398,141 @@ mod tests {
         logs
     }
 
+    fn go(group: &str, partition: i32, offset: Offset) -> GroupOffset {
+        GroupOffset {
+            group: group.into(),
+            partition,
+            offset,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_branch_takes_group_offsets_along_as_shared_refs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.git");
+        {
+            let storage = open(&path);
+            let source = orders(&storage).await;
+            source[0].commit_offset("billing", 2).await.unwrap();
+            source[1].commit_offset("my group", 1).await.unwrap();
+            let groups = [go("billing", 0, 2), go("my group", 1, 1)];
+            let fork = storage
+                .branch_topic(
+                    "replay",
+                    Uuid::new_v4(),
+                    "orders",
+                    "orders",
+                    &source,
+                    &[3, 1],
+                    &groups,
+                )
+                .await
+                .unwrap();
+            assert_eq!(fork[0].committed_offset("billing").await.unwrap(), Some(2));
+            assert_eq!(fork[1].committed_offset("my group").await.unwrap(), Some(1));
+            assert_eq!(fork[1].committed_offset("billing").await.unwrap(), None);
+        }
+        let rev = |r: &str| git(&path, &["rev-parse", r]).trim().to_string();
+        assert_eq!(
+            rev("refs/groups/billing/replay/0"),
+            rev("refs/groups/billing/orders/0")
+        );
+        let lag = git(
+            &path,
+            &[
+                "rev-list",
+                "--count",
+                "refs/groups/billing/replay/0..replay/0",
+            ],
+        );
+        assert_eq!(lag.trim(), "1");
+        let meta = git(&path, &["log", "-1", "--format=%B", meta::META_REF]);
+        assert!(meta.contains("group = \"billing\""), "{meta}");
+        git(&path, &["fsck", "--strict", "--no-dangling"]);
+
+        let loaded = open(&path).load().await.unwrap();
+        let replay = loaded.topics.iter().find(|t| t.name == "replay").unwrap();
+        assert_eq!(
+            replay.partitions[0]
+                .committed_offset("billing")
+                .await
+                .unwrap(),
+            Some(2)
+        );
+        assert!(loaded.groups.contains(&"my group".to_string()));
+    }
+
+    #[tokio::test]
+    async fn recorded_group_offsets_are_repaired_but_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.git");
+        {
+            let storage = open(&path);
+            orders(&storage).await;
+            drop(storage);
+            let store = GitStore::open_or_init(&path).unwrap();
+            let head = store.ref_target("refs/heads/orders/0").unwrap().unwrap();
+            // the meta commit landed; neither the fork's refs nor its group refs did
+            meta::append(
+                &store,
+                &MetaEvent::BranchTopic {
+                    name: "replay".into(),
+                    topic_id: Uuid::new_v4(),
+                    from: "orders".into(),
+                    root: "orders".into(),
+                    at: vec![3, 1],
+                    heads: vec![
+                        head.to_string(),
+                        store
+                            .ref_target("refs/heads/orders/1")
+                            .unwrap()
+                            .unwrap()
+                            .to_string(),
+                    ],
+                    group_offsets: vec![go("billing", 0, 2)],
+                },
+                now_ms(),
+            )
+            .unwrap();
+        }
+        {
+            let loaded = open(&path).load().await.unwrap();
+            let replay = loaded.topics.iter().find(|t| t.name == "replay").unwrap();
+            assert_eq!(
+                replay.partitions[0]
+                    .committed_offset("billing")
+                    .await
+                    .unwrap(),
+                Some(2)
+            );
+            // the group moves on, on the fork
+            replay.partitions[0]
+                .commit_offset("billing", 0)
+                .await
+                .unwrap();
+        }
+        let loaded = open(&path).load().await.unwrap();
+        let replay = loaded.topics.iter().find(|t| t.name == "replay").unwrap();
+        assert_eq!(
+            replay.partitions[0]
+                .committed_offset("billing")
+                .await
+                .unwrap(),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn branch_events_from_before_group_offsets_still_load() {
+        let old = "event = \"BranchTopic\"\nname = \"replay\"\n\
+                   topic_id = \"6f1c3b5e-8a51-4a7e-9a4b-2f0d7c9e1a11\"\n\
+                   from = \"orders\"\nroot = \"orders\"\nat = [1]\nheads = [\"ab\"]\n";
+        match toml::from_str::<MetaEvent>(old).unwrap() {
+            MetaEvent::BranchTopic { group_offsets, .. } => assert!(group_offsets.is_empty()),
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn a_git_branch_shares_commits_and_survives_a_restart() {
         let dir = tempfile::tempdir().unwrap();
@@ -367,7 +547,7 @@ mod tests {
                 .await
                 .unwrap();
             let fork = storage
-                .branch_topic("replay", id, "orders", "orders", &source, &[2, 1])
+                .branch_topic("replay", id, "orders", "orders", &source, &[2, 1], &[])
                 .await
                 .unwrap();
             assert_eq!(fork[0].high_watermark(), 2);
@@ -415,6 +595,7 @@ mod tests {
                     root: "orders".into(),
                     at: vec![2, 1],
                     heads: vec![two.to_string(), p1.to_string()],
+                    group_offsets: vec![],
                 },
                 now_ms(),
             )
@@ -449,6 +630,7 @@ mod tests {
                     "orders",
                     &source,
                     &[0, 0],
+                    &[],
                 )
                 .await
                 .err()
@@ -485,6 +667,7 @@ mod tests {
                     "orders",
                     &source,
                     &[1, 0],
+                    &[],
                 )
                 .await
                 .err()
@@ -515,6 +698,7 @@ mod tests {
                     root: "orders".into(),
                     at: vec![0],
                     heads: vec![missing],
+                    group_offsets: vec![],
                 },
                 now_ms(),
             )
@@ -533,7 +717,15 @@ mod tests {
         let recs = (0..3).map(|i| Record::text(i, "x")).collect();
         source[0].append("app", recs).await.unwrap();
         let fork = MemStorage
-            .branch_topic("replay", Uuid::new_v4(), "orders", "orders", &source, &[2])
+            .branch_topic(
+                "replay",
+                Uuid::new_v4(),
+                "orders",
+                "orders",
+                &source,
+                &[2],
+                &[],
+            )
             .await
             .unwrap();
         assert_eq!(
