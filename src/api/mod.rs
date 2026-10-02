@@ -39,7 +39,8 @@ pub const SUPPORTED: &[(ApiKey, i16, i16)] = &[
     (ApiKey::LeaveGroup, 0, 5),
     (ApiKey::ListGroups, 0, 5),
     (ApiKey::DescribeGroups, 0, 6),
-    (ApiKey::InitProducerId, 0, 6),
+    // v6 (two-phase commit) exists, but kafka-protocol 0.18 cannot decode its request.
+    (ApiKey::InitProducerId, 0, 5),
 ];
 
 pub fn supported_range(key: ApiKey) -> Option<(i16, i16)> {
