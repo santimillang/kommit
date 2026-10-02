@@ -275,6 +275,10 @@ impl PartitionLog for GitLog {
     fn high_watermark(&self) -> Offset {
         self.index.read().unwrap().len() as Offset - 1
     }
+
+    fn fault(&self) -> Option<String> {
+        self.fault.lock().unwrap().clone()
+    }
 }
 
 #[cfg(test)]

@@ -138,6 +138,16 @@ pub async fn resolve(
     at: &BranchAt,
     source: &[Arc<dyn PartitionLog>],
 ) -> Result<Vec<Offset>, ResolveError> {
+    // A faulted branch was moved behind kommit's back, so Git no longer holds what its
+    // consumers were shown. Forking it would copy that, silently.
+    for (p, log) in source.iter().enumerate() {
+        if let Some(fault) = log.fault() {
+            return Err(LogError::Faulted(format!(
+                "source partition {p} is faulted and cannot be branched: {fault}"
+            ))
+            .into());
+        }
+    }
     match at {
         BranchAt::Head => Ok(source.iter().map(|log| log.high_watermark()).collect()),
         BranchAt::Offsets(map) => {
@@ -332,6 +342,34 @@ mod tests {
             match resolve(&at, &source).await {
                 Err(ResolveError::Invalid(msg)) => assert!(msg.contains(needle), "{msg}"),
                 other => panic!("{needle}: got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_faulted_partition_cannot_be_forked() {
+        use crate::git::store::GitStore;
+        use crate::log::git::GitLog;
+        let dir = tempfile::tempdir().unwrap();
+        let s = Arc::new(GitStore::open_or_init(&dir.path().join("d.git")).unwrap());
+        let log = GitLog::open_or_create(s.clone(), "orders", 0)
+            .await
+            .unwrap();
+        log.append("app", vec![Record::text(1, "a")]).await.unwrap();
+        // someone moves the branch back behind kommit's back; the next append faults it
+        let head = s.ref_target("refs/heads/orders/0").unwrap().unwrap();
+        let root = s.first_parent_chain(head).unwrap()[0];
+        s.cas_ref("refs/heads/orders/0", Some(head), root, "vandal")
+            .unwrap();
+        assert!(log.append("app", vec![Record::text(2, "b")]).await.is_err());
+
+        let source = vec![Arc::new(log) as Arc<dyn PartitionLog>];
+        for at in [BranchAt::Head, offsets(&[(0, 0)]), BranchAt::Timestamp(0)] {
+            match resolve(&at, &source).await {
+                Err(ResolveError::Log(LogError::Faulted(msg))) => {
+                    assert!(msg.contains("partition 0"), "{msg}")
+                }
+                other => panic!("{at:?}: got {other:?}"),
             }
         }
     }

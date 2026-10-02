@@ -32,6 +32,10 @@ pub trait PartitionLog: Send + Sync {
     fn log_start(&self) -> Offset {
         0
     }
+    /// Why the log refuses writes, if it does (its branch moved behind kommit's back).
+    fn fault(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Applies the byte and count limits shared by every implementation's read path.
