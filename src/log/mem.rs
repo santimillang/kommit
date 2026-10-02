@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::RwLock;
 
 use crate::log::{LogError, PartitionLog, take_within_limit};
@@ -7,10 +8,26 @@ use crate::record::{Offset, Record};
 #[derive(Default)]
 pub struct MemLog {
     records: RwLock<Vec<Record>>,
+    committed: RwLock<HashMap<String, Offset>>,
 }
 
 #[async_trait::async_trait]
 impl PartitionLog for MemLog {
+    async fn commit_offset(&self, group: &str, offset: Offset) -> Result<(), LogError> {
+        if !(0..=self.high_watermark()).contains(&offset) {
+            return Err(LogError::OutOfRange(offset));
+        }
+        self.committed
+            .write()
+            .unwrap()
+            .insert(group.to_string(), offset);
+        Ok(())
+    }
+
+    async fn committed_offset(&self, group: &str) -> Result<Option<Offset>, LogError> {
+        Ok(self.committed.read().unwrap().get(group).copied())
+    }
+
     async fn append(&self, _producer: &str, records: Vec<Record>) -> Result<Offset, LogError> {
         let mut log = self.records.write().unwrap();
         let base = log.len() as Offset;

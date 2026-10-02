@@ -44,4 +44,24 @@ pub async fn run_all(log: &dyn PartitionLog) {
     assert_eq!(log.offset_for_timestamp(150).await.unwrap(), Some((1, 300)));
     assert_eq!(log.offset_for_timestamp(250).await.unwrap(), Some((1, 300)));
     assert_eq!(log.offset_for_timestamp(301).await.unwrap(), None);
+
+    // committed offsets: per group, anywhere in 0..=hw, may move backwards
+    assert_eq!(log.committed_offset("g").await.unwrap(), None);
+    log.commit_offset("g", 0).await.unwrap();
+    assert_eq!(log.committed_offset("g").await.unwrap(), Some(0));
+    log.commit_offset("g", 2).await.unwrap();
+    assert_eq!(log.committed_offset("g").await.unwrap(), Some(2));
+    log.commit_offset("g", 3).await.unwrap();
+    assert_eq!(log.committed_offset("g").await.unwrap(), Some(3));
+    assert!(matches!(
+        log.commit_offset("g", 4).await,
+        Err(LogError::OutOfRange(4))
+    ));
+    assert!(matches!(
+        log.commit_offset("g", -1).await,
+        Err(LogError::OutOfRange(-1))
+    ));
+    log.commit_offset("g", 0).await.unwrap();
+    assert_eq!(log.committed_offset("g").await.unwrap(), Some(0));
+    assert_eq!(log.committed_offset("other").await.unwrap(), None);
 }

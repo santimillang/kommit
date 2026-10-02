@@ -116,6 +116,36 @@ impl GitStore {
         Ok(())
     }
 
+    /// Points `name` at `new` unconditionally, creating it if needed.
+    pub fn set_ref(&self, name: &str, new: ObjectId, message: &str) -> Result<()> {
+        self.repo.to_thread_local().edit_reference(RefEdit {
+            change: Change::Update {
+                log: LogChange {
+                    message: message.into(),
+                    ..Default::default()
+                },
+                expected: PreviousValue::Any,
+                new: Target::Object(new),
+            },
+            name: name.try_into()?,
+            deref: false,
+        })?;
+        Ok(())
+    }
+
+    /// Every ref under `prefix` with the object it points at.
+    pub fn refs_with_prefix(&self, prefix: &str) -> Result<Vec<(String, ObjectId)>> {
+        let repo = self.repo.to_thread_local();
+        let platform = repo.references()?;
+        let mut out = Vec::new();
+        for r in platform.prefixed(prefix)? {
+            let r = r.map_err(|e| anyhow!("{e}"))?;
+            let name = r.name().as_bstr().to_string();
+            out.push((name, r.into_fully_peeled_id()?.detach()));
+        }
+        Ok(out)
+    }
+
     /// The first-parent chain ending at `head`, oldest first.
     pub fn first_parent_chain(&self, head: ObjectId) -> Result<Vec<ObjectId>> {
         let repo = self.repo.to_thread_local();

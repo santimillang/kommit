@@ -24,6 +24,10 @@ pub trait PartitionLog: Send + Sync {
     async fn read(&self, from: Offset, max_bytes: usize)
     -> Result<Vec<(Offset, Record)>, LogError>;
     async fn offset_for_timestamp(&self, ts_ms: i64) -> Result<Option<(Offset, i64)>, LogError>;
+    /// Records `offset` (the next record the group will read) for `group`.
+    /// Any offset in `0..=high_watermark` is allowed, including moving backwards.
+    async fn commit_offset(&self, group: &str, offset: Offset) -> Result<(), LogError>;
+    async fn committed_offset(&self, group: &str) -> Result<Option<Offset>, LogError>;
     fn high_watermark(&self) -> Offset;
     fn log_start(&self) -> Offset {
         0

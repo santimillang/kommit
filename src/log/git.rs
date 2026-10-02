@@ -5,6 +5,7 @@ use gix::ObjectId;
 
 use crate::git::encode::{commit_to_record, record_to_commit, sentinel_commit, sentinel_of};
 use crate::git::store::GitStore;
+use crate::groups::group_ref_component;
 use crate::log::{LogError, MAX_READ_RECORDS, PartitionLog, take_within_limit};
 use crate::record::{Offset, Record, now_ms};
 
@@ -12,8 +13,19 @@ pub fn partition_ref(topic: &str, partition: i32) -> String {
     format!("refs/heads/{topic}/{partition}")
 }
 
+/// Where `group`'s committed offset for a partition lives. It points at first-parent
+/// position `c` for committed offset `c`, so `git rev-list --count <it>..<branch>` is the lag.
+pub fn group_ref(group: &str, topic: &str, partition: i32) -> String {
+    format!(
+        "refs/groups/{}/{topic}/{partition}",
+        group_ref_component(group)
+    )
+}
+
 pub struct GitLog {
     store: Arc<GitStore>,
+    topic: String,
+    partition: i32,
     ref_name: String,
     /// index[0] is the sentinel; record offset k is index[k + 1].
     index: RwLock<Vec<ObjectId>>,
@@ -57,6 +69,8 @@ impl GitLog {
         .await??;
         Ok(GitLog {
             store,
+            topic: topic.to_string(),
+            partition,
             ref_name,
             index: RwLock::new(index),
             writer: tokio::sync::Mutex::new(()),
@@ -67,6 +81,50 @@ impl GitLog {
 
 #[async_trait::async_trait]
 impl PartitionLog for GitLog {
+    async fn commit_offset(&self, group: &str, offset: Offset) -> Result<(), LogError> {
+        let target = {
+            let index = self.index.read().unwrap();
+            usize::try_from(offset)
+                .ok()
+                .and_then(|c| index.get(c).copied())
+                .ok_or(LogError::OutOfRange(offset))?
+        };
+        let (store, r) = (
+            self.store.clone(),
+            group_ref(group, &self.topic, self.partition),
+        );
+        tokio::task::spawn_blocking(move || {
+            store.set_ref(&r, target, &format!("kommit: commit offset {offset}"))
+        })
+        .await
+        .map_err(storage)?
+        .map_err(storage)
+    }
+
+    async fn committed_offset(&self, group: &str) -> Result<Option<Offset>, LogError> {
+        let (store, r) = (
+            self.store.clone(),
+            group_ref(group, &self.topic, self.partition),
+        );
+        let target = tokio::task::spawn_blocking(move || store.ref_target(&r))
+            .await
+            .map_err(storage)?
+            .map_err(storage)?;
+        let Some(target) = target else {
+            return Ok(None);
+        };
+        let position = self
+            .index
+            .read()
+            .unwrap()
+            .iter()
+            .rposition(|id| *id == target);
+        if position.is_none() {
+            tracing::warn!(group, partition = %self.ref_name, "committed offset ref points outside the partition; ignoring it");
+        }
+        Ok(position.map(|p| p as Offset))
+    }
+
     async fn append(&self, producer: &str, records: Vec<Record>) -> Result<Offset, LogError> {
         let _writer = self.writer.lock().await;
         if let Some(fault) = self.fault.lock().unwrap().clone() {
@@ -271,6 +329,55 @@ mod tests {
         ));
         // history was not rewritten by kommit
         assert_eq!(s.ref_target("refs/heads/orders/0").unwrap(), Some(root));
+    }
+
+    #[tokio::test]
+    async fn committed_offsets_are_refs_and_git_measures_the_lag() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("d.git");
+        {
+            let log = GitLog::open_or_create(store(&dir), "orders", 0)
+                .await
+                .unwrap();
+            let recs = (0..5).map(|i| Record::text(i, "x")).collect();
+            log.append("app", recs).await.unwrap();
+            for group in ["billing", "my group", "a..b", "über", ""] {
+                log.commit_offset(group, 2).await.unwrap();
+            }
+        }
+        let lag = git(
+            &repo,
+            &[
+                "rev-list",
+                "--count",
+                "refs/groups/billing/orders/0..orders/0",
+            ],
+        );
+        assert_eq!(lag.trim(), "3");
+        git(&repo, &["fsck", "--strict", "--no-dangling"]);
+
+        // survives a reopen, for ref-hostile group ids too
+        let log = GitLog::open_or_create(store(&dir), "orders", 0)
+            .await
+            .unwrap();
+        for group in ["billing", "my group", "a..b", "über", ""] {
+            assert_eq!(
+                log.committed_offset(group).await.unwrap(),
+                Some(2),
+                "{group:?}"
+            );
+        }
+        // offset 0 points at the sentinel: lag is the whole partition
+        log.commit_offset("billing", 0).await.unwrap();
+        let lag = git(
+            &repo,
+            &[
+                "rev-list",
+                "--count",
+                "refs/groups/billing/orders/0..orders/0",
+            ],
+        );
+        assert_eq!(lag.trim(), "5");
     }
 
     #[tokio::test]
