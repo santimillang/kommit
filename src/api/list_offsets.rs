@@ -19,8 +19,9 @@ pub async fn handle(broker: &Broker, req: ListOffsetsRequest) -> ListOffsetsResp
             let base = ListOffsetsPartitionResponse::default()
                 .with_partition_index(p.partition_index)
                 .with_offset(-1)
-                .with_timestamp(-1)
-                .with_leader_epoch(0);
+                // leader_epoch stays at its default (-1, unknown): it only exists from v4,
+                // and setting it breaks encoding for older clients such as librdkafka 1.8.
+                .with_timestamp(-1);
             let Some(log) = topic
                 .as_ref()
                 .and_then(|tp| tp.partition(p.partition_index))

@@ -150,7 +150,9 @@ impl TestClient {
         let header = self.header(R::KEY, version);
         let mut buf = BytesMut::new();
         header.encode(&mut buf, R::header_version(version)).unwrap();
-        req.encode(&mut buf, version).unwrap();
+        req.encode(&mut buf, version).unwrap_or_else(|e| {
+            panic!("test client cannot encode api {} v{version}: {e:#}", R::KEY)
+        });
         buf
     }
 
@@ -160,7 +162,7 @@ impl TestClient {
         let mut resp = read_frame(&mut self.stream)
             .await
             .unwrap()
-            .expect("broker closed the connection");
+            .unwrap_or_else(|| panic!("broker closed the connection on api {} v{version}", R::KEY));
         let rh = ResponseHeader::decode(
             &mut resp,
             <R::Response as HeaderVersion>::header_version(version),
