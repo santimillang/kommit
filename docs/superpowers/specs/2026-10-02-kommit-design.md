@@ -162,8 +162,9 @@ meta event is appended, then one sentinel-rooted branch is created per partition
 A committed offset *c* ("next record to read") is stored as `refs/groups/<g>/<t>/<p>`
 pointing at first-parent position *c* of the partition (the sentinel for *c = 0*, record
 *c−1* otherwise). Therefore `git rev-list --count refs/groups/g/t/p..t/p` equals the lag.
-Every commit of an offset appends a reflog entry naming the member, so the reflog is an audit
-trail. Offset-commit metadata strings are not stored (returned empty).
+Offset-commit metadata strings are not stored (returned empty). (An earlier draft promised a
+reflog audit trail per commit; Git does not keep reflogs for custom ref namespaces like
+`refs/groups/` in a bare repo without extra config, so M2 does not provide one. See §6.4.)
 
 ### 6.2 Group coordination
 
@@ -197,6 +198,12 @@ scope.
   (producer, topic, partition), returns the original offset for a retried batch, and refuses
   sequence gaps; producers seen first after a restart may start at any sequence.
 - InitProducerId is advertised up to v5: kafka-protocol 0.18 cannot decode v6 requests.
+- Like Kafka, completing a join restarts every member's session, and members parked in a join
+  or sync never expire. Offset commits are allowed during PreparingRebalance (consumers commit
+  on revoke) and refused during CompletingRebalance.
+- De-duplication tracks the producer epoch (KIP-360): a newer epoch restarts sequences at 0,
+  an older one gets `INVALID_PRODUCER_EPOCH`.
+- No offset-commit audit trail: the committed-offset refs are not reflogged.
 - Real clients are tested in CI: `kcat -G`, and Apache Kafka 4.1's console producer,
   console consumer group and `kafka-consumer-groups --describe`.
 
