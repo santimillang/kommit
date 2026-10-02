@@ -1,4 +1,5 @@
 pub mod api;
+pub mod branch;
 pub mod broker;
 pub mod config;
 pub mod git;
