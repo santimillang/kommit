@@ -83,6 +83,18 @@ fn validate_partitions(partitions: i32) -> Result<(), CreateTopicError> {
     }
 }
 
+/// Releases a name reserved by `Broker::branch_topic`, whether it succeeded or not.
+struct Reservation<'a> {
+    branching: &'a std::sync::Mutex<std::collections::BTreeSet<String>>,
+    name: &'a str,
+}
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        self.branching.lock().unwrap().remove(self.name);
+    }
+}
+
 /// Producer ids are recorded in blocks so a restart never hands one out twice.
 const PRODUCER_ID_BLOCK: i64 = 1000;
 
@@ -96,6 +108,9 @@ pub struct Broker {
     pub config: Config,
     storage: Arc<dyn Storage>,
     topics: RwLock<BTreeMap<String, Arc<TopicState>>>,
+    /// Names being branched right now. A fork walks whole histories, so it reserves its
+    /// name here instead of holding the topics lock while storage works.
+    branching: std::sync::Mutex<std::collections::BTreeSet<String>>,
     appended: watch::Sender<u64>,
     producer_ids: tokio::sync::Mutex<ProducerIds>,
     known_groups: Vec<String>,
@@ -125,6 +140,7 @@ impl Broker {
             coordinator,
             idempotence: IdempotenceCache::default(),
             topics: RwLock::new(topics),
+            branching: Default::default(),
             appended: watch::channel(0).0,
             producer_ids: tokio::sync::Mutex::new(ProducerIds {
                 next: loaded.producer_id_high,
@@ -187,7 +203,7 @@ impl Broker {
         validate_partitions(partitions)?;
         // Hold the write lock across storage so two creators cannot race.
         let mut topics = self.topics.write().await;
-        if topics.contains_key(name) {
+        if topics.contains_key(name) || self.branching.lock().unwrap().contains(name) {
             return Err(CreateTopicError::AlreadyExists);
         }
         let topic_id = Uuid::new_v4();
@@ -206,8 +222,9 @@ impl Broker {
         Ok(state)
     }
 
-    /// Forks `spec.from` as `name`. Fork points are resolved before taking the topics lock
-    /// (a timestamp scan reads every commit), which is safe because logs only grow.
+    /// Forks `spec.from` as `name`. Resolving fork points and writing the fork both read
+    /// whole histories, so neither holds the topics lock: the name is reserved in
+    /// `branching` instead, which is safe because logs only grow.
     /// Returns the fork's partition count and, unless `validate_only`, the new topic.
     pub async fn branch_topic(
         &self,
@@ -241,10 +258,17 @@ impl Broker {
         if validate_only {
             return Ok((count, None));
         }
-        let mut topics = self.topics.write().await;
-        if topics.contains_key(name) {
-            return Err(CreateTopicError::AlreadyExists);
-        }
+        let _reserved = {
+            let topics = self.topics.read().await;
+            let mut branching = self.branching.lock().unwrap();
+            if topics.contains_key(name) || !branching.insert(name.to_string()) {
+                return Err(CreateTopicError::AlreadyExists);
+            }
+            Reservation {
+                branching: &self.branching,
+                name,
+            }
+        };
         let topic_id = Uuid::new_v4();
         let logs = self
             .storage
@@ -263,7 +287,11 @@ impl Broker {
             root: source.root.clone(),
             partitions: logs,
         });
-        topics.insert(name.to_string(), state.clone());
+        // Inserted while the reservation still holds the name, so no creator slips in.
+        self.topics
+            .write()
+            .await
+            .insert(name.to_string(), state.clone());
         tracing::info!(topic = name, from = %spec.from, ?at, "branched topic");
         Ok((count, Some(state)))
     }
@@ -308,6 +336,88 @@ mod tests {
         let mut config = Config::for_tests();
         config.auto_create_topics = auto_create;
         Broker::start(config, Arc::new(MemStorage)).await.unwrap()
+    }
+
+    /// MemStorage whose branch_topic parks until released, like a fork of a long history.
+    struct SlowBranches {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl Storage for SlowBranches {
+        async fn load(&self) -> anyhow::Result<crate::storage::Loaded> {
+            MemStorage.load().await
+        }
+        async fn create_topic(
+            &self,
+            name: &str,
+            topic_id: Uuid,
+            partitions: i32,
+        ) -> anyhow::Result<Vec<Arc<dyn PartitionLog>>> {
+            MemStorage.create_topic(name, topic_id, partitions).await
+        }
+        async fn branch_topic(
+            &self,
+            name: &str,
+            topic_id: Uuid,
+            from: &str,
+            root: &str,
+            source: &[Arc<dyn PartitionLog>],
+            at: &[crate::record::Offset],
+        ) -> anyhow::Result<Vec<Arc<dyn PartitionLog>>> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            MemStorage
+                .branch_topic(name, topic_id, from, root, source, at)
+                .await
+        }
+        async fn allocate_producer_ids(&self, _up_to: i64) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_slow_branch_does_not_block_other_topics() {
+        let storage = Arc::new(SlowBranches {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let broker = Broker::start(Config::for_tests(), storage.clone())
+            .await
+            .unwrap();
+        broker.create_topic("orders", 1).await.unwrap();
+        broker.create_topic("other", 1).await.unwrap();
+        let spec = BranchSpec {
+            from: "orders".into(),
+            at: crate::branch::BranchAt::Head,
+        };
+        let forking = tokio::spawn({
+            let broker = broker.clone();
+            async move { broker.branch_topic("replay", -1, &spec, false).await }
+        });
+        storage.entered.notified().await;
+
+        let quick = std::time::Duration::from_secs(1);
+        let other = tokio::time::timeout(quick, broker.topic("other")).await;
+        assert!(matches!(other, Ok(Some(_))), "lookups wait for the fork");
+        let created = tokio::time::timeout(quick, broker.create_topic("fresh", 1)).await;
+        assert!(matches!(created, Ok(Ok(_))), "creates wait for the fork");
+        // the name being forked is taken, by create and by a second branch alike
+        let dup = tokio::time::timeout(quick, broker.create_topic("replay", 1)).await;
+        assert!(
+            matches!(dup, Ok(Err(CreateTopicError::AlreadyExists))),
+            "a second creator got {:?}",
+            dup.map(|r| r.err())
+        );
+
+        storage.release.notify_one();
+        forking.await.unwrap().unwrap();
+        assert!(broker.topic("replay").await.is_some());
+        assert!(matches!(
+            broker.create_topic("replay", 1).await,
+            Err(CreateTopicError::AlreadyExists)
+        ));
     }
 
     #[tokio::test]
