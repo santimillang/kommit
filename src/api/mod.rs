@@ -1,10 +1,12 @@
 pub mod api_versions;
 pub mod create_topics;
+pub mod describe_groups;
 pub mod fetch;
 pub mod find_coordinator;
 pub mod heartbeat;
 pub mod join_group;
 pub mod leave_group;
+pub mod list_groups;
 pub mod list_offsets;
 pub mod metadata;
 pub mod offset_commit;
@@ -34,6 +36,8 @@ pub const SUPPORTED: &[(ApiKey, i16, i16)] = &[
     (ApiKey::SyncGroup, 0, 5),
     (ApiKey::Heartbeat, 0, 4),
     (ApiKey::LeaveGroup, 0, 5),
+    (ApiKey::ListGroups, 0, 5),
+    (ApiKey::DescribeGroups, 0, 6),
 ];
 
 pub fn supported_range(key: ApiKey) -> Option<(i16, i16)> {
@@ -97,6 +101,12 @@ pub async fn dispatch(
         RequestKind::LeaveGroup(r) => Some(ResponseKind::LeaveGroup(leave_group::handle(
             broker, ctx, r,
         ))),
+        RequestKind::ListGroups(r) => Some(ResponseKind::ListGroups(list_groups::handle(
+            broker, ctx, r,
+        ))),
+        RequestKind::DescribeGroups(r) => Some(ResponseKind::DescribeGroups(
+            describe_groups::handle(broker, r),
+        )),
         // The server only dispatches APIs listed in SUPPORTED.
         _ => None,
     }
