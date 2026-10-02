@@ -6,12 +6,9 @@
 **Kafka, except every record is a Git commit.**
 
 kommit is a single Kafka broker written in Rust whose only storage is a Git
-repository. Point `kcat` or another librdkafka-based client at it and it just
-sees a broker. Underneath, your topic is a branch, every message is a commit,
-and `git log` is a consumer.
-
-> Consumer groups and idempotent producers arrive in M2. Until then, clients
-> that need them (the Java console tools, `kcat -G`) will not connect.
+repository. Point Kafka clients at it (`kcat`, librdkafka, and Kafka's own Java
+console tools are tested in CI) and they just see a broker. Underneath, your
+topic is a branch, every message is a commit, and `git log` is a consumer.
 
 It is a joke. It also passes `git fsck --strict`.
 
@@ -23,18 +20,25 @@ It is a joke. It also passes `git fsck --strict`.
 | partition | branch `refs/heads/<topic>/<partition>` |
 | offset *k* | the *k+1*-th commit on that branch (after a sentinel root) |
 | produce | write the commits, then one compare-and-swap ref update |
+| consumer group offset | ref `refs/groups/<group>/<topic>/<partition>`, trailing the branch |
+| consumer lag | `git rev-list --count <group ref>..<branch>`. Really. |
 | cluster metadata | a commit log at `refs/kommit/meta`, like KRaft |
 | retention | none. Git never forgets. |
 
-A partition, as Git sees it:
+A partition, as Git sees it, with the `billing` group two records behind:
 
 ```mermaid
 %%{init: { 'gitGraph': { 'mainBranchName': 'orders/0' } } }%%
 gitGraph
   commit id: "kommit: partition orders/0 created"
-  commit id: "offset 0: hello"
+  commit id: "offset 0: hello" tag: "refs/groups/billing"
   commit id: "offset 1: world"
   commit id: "offset 2: zipped"
+```
+
+```console
+$ git rev-list --count refs/groups/billing/orders/0..orders/0
+2
 ```
 
 And what happens when you produce:
@@ -60,10 +64,11 @@ half-written batch, just some dangling objects for `git gc`.
 cargo run -- --data demo.git --listen 127.0.0.1:9092 --advertised-host 127.0.0.1
 
 printf 'hello\nworld\n' | kcat -b 127.0.0.1:9092 -P -t orders
-kcat -b 127.0.0.1:9092 -C -t orders -o beginning -e
+kcat -b 127.0.0.1:9092 -G billing -X auto.offset.reset=earliest -c 2 orders
 
-git --git-dir demo.git log --oneline orders/0       # consume, but make it Git
-git --git-dir demo.git push --all <your-remote>     # your topics, now on GitHub
+git --git-dir demo.git log --oneline orders/0                      # consume, but make it Git
+git --git-dir demo.git rev-list --count refs/groups/billing/orders/0..orders/0   # lag
+git --git-dir demo.git push --all <your-remote>                    # your topics, now on GitHub
 ```
 
 ## Things you can now do to a message queue
@@ -78,10 +83,10 @@ git --git-dir demo.git push --all <your-remote>     # your topics, now on GitHub
 | Milestone | What | |
 |---|---|---|
 | M1 | Produce, Fetch (long polling), Metadata, CreateTopics, ListOffsets, ApiVersions | done |
-| M2 | Consumer groups, with committed offsets as refs, so lag is `git rev-list --count` | next |
-| M3 | Topic branching: fork a topic at an offset with `git branch`, zero copy | later |
+| M2 | Consumer groups (classic protocol), committed offsets as refs, idempotent producers | done |
+| M3 | Topic branching: fork a topic at an offset with `git branch`, zero copy | next |
 
-Single broker, plaintext only, no durability guarantees, no retention.
+Single broker, plaintext only, no transactions, no durability guarantees, no retention.
 Please do not put it in production. It will let you, and it will work.
 
 Design notes: [`docs/superpowers/specs/2026-10-02-kommit-design.md`](docs/superpowers/specs/2026-10-02-kommit-design.md).

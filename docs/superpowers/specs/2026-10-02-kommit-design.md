@@ -184,6 +184,22 @@ ids, so not every producer writes a meta commit). Retried duplicate batches are 
 the last sequence number per (producer id, partition), held in memory. Transactions are out of
 scope.
 
+### 6.4 As built in M2
+
+- Group ids that are not valid topic-style names are stored in refs as `%` + hex of their
+  UTF-8 bytes (`refs/groups/%6d792067726f7570/...` for `my group`).
+- Committing an offset beyond the high watermark returns `OFFSET_OUT_OF_RANGE`: a ref cannot
+  point past the branch head.
+- JoinGroup assigns member ids on the first join (no `MEMBER_ID_REQUIRED` round trip). A
+  group leaving Empty waits `--group-initial-rebalance-delay-ms` (default 3000, as Kafka) so
+  members that start together share a generation.
+- Producer ids come in blocks of 1000. De-duplication remembers the last 5 batches per
+  (producer, topic, partition), returns the original offset for a retried batch, and refuses
+  sequence gaps; producers seen first after a restart may start at any sequence.
+- InitProducerId is advertised up to v5: kafka-protocol 0.18 cannot decode v6 requests.
+- Real clients are tested in CI: `kcat -G`, and Apache Kafka 4.1's console producer,
+  console consumer group and `kafka-consumer-groups --describe`.
+
 ## 7. Branching topics (M3)
 
 A fork is requested through the normal `CreateTopics` API, so any Kafka admin tool works:
