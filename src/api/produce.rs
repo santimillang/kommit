@@ -1,3 +1,6 @@
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
+
 use kafka_protocol::ResponseError;
 use kafka_protocol::messages::produce_request::TopicProduceData;
 use kafka_protocol::messages::produce_response::{PartitionProduceResponse, TopicProduceResponse};
@@ -6,8 +9,23 @@ use kafka_protocol::protocol::StrBytes;
 
 use crate::api::{log_error_code, records};
 use crate::broker::Broker;
+use crate::log::PartitionLog;
+use crate::record::Offset;
 
-/// Returns `None` for acks=0, which gets no response at all.
+/// How many recent batches per producer and partition are remembered for de-duplication
+/// (Kafka keeps five: the most a producer may have in flight).
+const REMEMBERED_BATCHES: usize = 5;
+
+/// Recent idempotent batches: (first sequence, last sequence, base offset).
+type RecentBatches = VecDeque<(i32, i32, Offset)>;
+
+/// Per (producer id, topic, partition) memory of recent batches. Held across the
+/// append, so a check and its append cannot interleave with another request's.
+#[derive(Default)]
+pub struct IdempotenceCache {
+    batches: tokio::sync::Mutex<HashMap<(i64, String, i32), RecentBatches>>,
+}
+
 pub async fn handle(
     broker: &Broker,
     client_id: &str,
@@ -31,8 +49,8 @@ pub async fn handle(
                     .push(base.with_error_code(ResponseError::UnknownTopicOrPartition.code()));
                 continue;
             };
-            let decoded = match pd.records.map(records::decode_batches).transpose() {
-                Ok(recs) => recs.unwrap_or_default(),
+            let batches = match pd.records.map(records::decode_produce_batches).transpose() {
+                Ok(batches) => batches.unwrap_or_default(),
                 Err(e) => {
                     partitions.push(
                         base.with_error_code(ResponseError::CorruptMessage.code())
@@ -41,13 +59,25 @@ pub async fn handle(
                     continue;
                 }
             };
-            let records = decoded.into_iter().map(|(_, r)| r).collect();
-            partitions.push(match log.append(client_id, records).await {
-                Ok(offset) => base
-                    .with_base_offset(offset)
+            let mut first_offset = None;
+            let mut error = None;
+            for batch in batches {
+                match append_batch(broker, &name.0, pd.index, log, client_id, batch).await {
+                    Ok(offset) => {
+                        first_offset.get_or_insert(offset);
+                    }
+                    Err(code) => {
+                        error = Some(code);
+                        break;
+                    }
+                }
+            }
+            partitions.push(match error {
+                Some(code) => base.with_error_code(code),
+                None => base
+                    .with_base_offset(first_offset.unwrap_or_else(|| log.high_watermark()))
                     .with_log_append_time_ms(-1)
                     .with_log_start_offset(0),
-                Err(e) => base.with_error_code(log_error_code(&e)),
             });
         }
         responses.push(
@@ -61,4 +91,47 @@ pub async fn handle(
         return None;
     }
     Some(ProduceResponse::default().with_responses(responses))
+}
+
+/// Appends one batch. Idempotent batches (producer id >= 0) are de-duplicated: a
+/// retry of a remembered batch returns its original offset without appending, and a
+/// sequence gap is refused. Unknown producers (e.g. after a restart) start anywhere.
+async fn append_batch(
+    broker: &Broker,
+    topic: &str,
+    partition: i32,
+    log: &Arc<dyn PartitionLog>,
+    client_id: &str,
+    batch: records::ProducedBatch,
+) -> Result<Offset, i16> {
+    if batch.producer_id < 0 {
+        return log
+            .append(client_id, batch.records)
+            .await
+            .map_err(|e| log_error_code(&e));
+    }
+    let mut cache = broker.idempotence.batches.lock().await;
+    let recent = cache
+        .entry((batch.producer_id, topic.to_string(), partition))
+        .or_default();
+    if let Some(&(_, _, offset)) = recent
+        .iter()
+        .find(|(first, _, _)| *first == batch.first_sequence)
+    {
+        return Ok(offset);
+    }
+    if let Some(&(_, last, _)) = recent.back()
+        && batch.first_sequence != last.wrapping_add(1)
+    {
+        return Err(ResponseError::OutOfOrderSequenceNumber.code());
+    }
+    let offset = log
+        .append(client_id, batch.records)
+        .await
+        .map_err(|e| log_error_code(&e))?;
+    recent.push_back((batch.first_sequence, batch.last_sequence, offset));
+    if recent.len() > REMEMBERED_BATCHES {
+        recent.pop_front();
+    }
+    Ok(offset)
 }

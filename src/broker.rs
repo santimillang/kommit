@@ -5,6 +5,7 @@ use kafka_protocol::ResponseError;
 use tokio::sync::{RwLock, watch};
 use uuid::Uuid;
 
+use crate::api::produce::IdempotenceCache;
 use crate::config::Config;
 use crate::groups::coordinator::Coordinator;
 use crate::log::PartitionLog;
@@ -92,6 +93,7 @@ pub struct Broker {
     producer_ids: tokio::sync::Mutex<ProducerIds>,
     known_groups: Vec<String>,
     pub coordinator: Arc<Coordinator>,
+    pub(crate) idempotence: IdempotenceCache,
 }
 
 impl Broker {
@@ -113,6 +115,7 @@ impl Broker {
             config,
             storage,
             coordinator,
+            idempotence: IdempotenceCache::default(),
             topics: RwLock::new(topics),
             appended: watch::channel(0).0,
             producer_ids: tokio::sync::Mutex::new(ProducerIds {

@@ -4,6 +4,7 @@ pub mod describe_groups;
 pub mod fetch;
 pub mod find_coordinator;
 pub mod heartbeat;
+pub mod init_producer_id;
 pub mod join_group;
 pub mod leave_group;
 pub mod list_groups;
@@ -38,6 +39,7 @@ pub const SUPPORTED: &[(ApiKey, i16, i16)] = &[
     (ApiKey::LeaveGroup, 0, 5),
     (ApiKey::ListGroups, 0, 5),
     (ApiKey::DescribeGroups, 0, 6),
+    (ApiKey::InitProducerId, 0, 6),
 ];
 
 pub fn supported_range(key: ApiKey) -> Option<(i16, i16)> {
@@ -106,6 +108,9 @@ pub async fn dispatch(
         ))),
         RequestKind::DescribeGroups(r) => Some(ResponseKind::DescribeGroups(
             describe_groups::handle(broker, r),
+        )),
+        RequestKind::InitProducerId(r) => Some(ResponseKind::InitProducerId(
+            init_producer_id::handle(broker, r).await,
         )),
         // The server only dispatches APIs listed in SUPPORTED.
         _ => None,

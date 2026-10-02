@@ -11,6 +11,23 @@ use kafka_protocol::records::{
 
 use crate::record::{Offset, Record};
 
+fn from_kafka(r: KafkaRecord) -> (Offset, Record) {
+    let headers = r
+        .headers
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+    (
+        r.offset,
+        Record {
+            timestamp_ms: r.timestamp,
+            key: r.key,
+            value: r.value,
+            headers,
+        },
+    )
+}
+
 /// Decodes (and decompresses) every batch, dropping control records.
 pub fn decode_batches(bytes: Bytes) -> Result<Vec<(Offset, Record)>> {
     let mut buf = bytes;
@@ -19,21 +36,37 @@ pub fn decode_batches(bytes: Bytes) -> Result<Vec<(Offset, Record)>> {
         .into_iter()
         .flat_map(|set| set.records)
         .filter(|r| !r.control)
-        .map(|r| {
-            let headers = r
-                .headers
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v))
-                .collect();
-            (
-                r.offset,
-                Record {
-                    timestamp_ms: r.timestamp,
-                    key: r.key,
-                    value: r.value,
-                    headers,
-                },
-            )
+        .map(from_kafka)
+        .collect())
+}
+
+/// One produced batch, with the idempotent-producer fields kept at batch level.
+pub struct ProducedBatch {
+    /// -1 when the producer is not idempotent.
+    pub producer_id: i64,
+    pub first_sequence: i32,
+    pub last_sequence: i32,
+    pub records: Vec<Record>,
+}
+
+/// Like [`decode_batches`], but keeps batch boundaries for de-duplication.
+pub fn decode_produce_batches(bytes: Bytes) -> Result<Vec<ProducedBatch>> {
+    let mut buf = bytes;
+    let sets = RecordBatchDecoder::decode_all(&mut buf)?;
+    Ok(sets
+        .into_iter()
+        .filter_map(|set| {
+            let records: Vec<KafkaRecord> =
+                set.records.into_iter().filter(|r| !r.control).collect();
+            let first = records.first()?;
+            let (producer_id, first_sequence) = (first.producer_id, first.sequence);
+            let last_sequence = records.last().map_or(first_sequence, |r| r.sequence);
+            Some(ProducedBatch {
+                producer_id,
+                first_sequence,
+                last_sequence,
+                records: records.into_iter().map(|r| from_kafka(r).1).collect(),
+            })
         })
         .collect())
 }
