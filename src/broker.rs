@@ -202,7 +202,9 @@ impl Broker {
     ) -> Result<(), CreateTopicError> {
         validate_topic_name(name).map_err(CreateTopicError::InvalidName)?;
         validate_partitions(partitions)?;
-        if self.topics.read().await.contains_key(name) {
+        if self.topics.read().await.contains_key(name)
+            || self.reserved.lock().unwrap().contains(name)
+        {
             return Err(CreateTopicError::AlreadyExists);
         }
         Ok(())
@@ -541,6 +543,11 @@ mod tests {
             "a second creator got {:?}",
             dup.map(|r| r.err())
         );
+        // and a validate-only create says so too, instead of promising success
+        assert!(matches!(
+            broker.validate_new_topic("replay", 1).await,
+            Err(CreateTopicError::AlreadyExists)
+        ));
 
         storage.release.notify_one();
         forking.await.unwrap().unwrap();
