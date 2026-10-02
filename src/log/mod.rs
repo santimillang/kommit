@@ -1,6 +1,6 @@
-// pub mod git; // restored in Task 5
 #[cfg(test)]
 pub mod contract;
+pub mod git;
 pub mod mem;
 
 use crate::record::{Offset, Record};
