@@ -12,7 +12,7 @@ base64 = "0.23.1"
 bytes = "1.12.1"
 clap = { version = "4.6.7", features = ["derive"] }
 gix = { version = "0.88", features = ["anyhow"] }
-kafka-protocol = "0.18"
+kafka-protocol = { version = "0.18", features = ["messages_enums"] }
 serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2.0.21"
 tokio = { version = "1.53.1", features = ["full"] }
