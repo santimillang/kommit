@@ -225,3 +225,54 @@ async fn forks_of_forks_survive_a_restart_and_share_commits() {
     );
     git(&["fsck", "--strict", "--no-dangling"]);
 }
+
+#[tokio::test]
+async fn the_cli_library_branches_and_reports_fork_points() {
+    let (addr, broker) = common::start_mem_broker().await;
+    broker.create_topic("orders", 2).await.unwrap();
+    let mut c = common::TestClient::connect(addr).await;
+    produce(&mut c, "orders", 0, &[(1, "a"), (2, "b")]).await;
+
+    let hws = kommit::cli::branch(&addr.to_string(), "orders", "replay", "0:1,1:0")
+        .await
+        .unwrap();
+    assert_eq!(hws, vec![1, 0]);
+    let err = kommit::cli::branch(&addr.to_string(), "nope", "x", "head")
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("nope does not exist"),
+        "{err:#}"
+    );
+}
+
+#[tokio::test]
+async fn the_kommit_binary_has_a_branch_subcommand() {
+    let (addr, broker) = common::start_mem_broker().await;
+    broker.create_topic("orders", 1).await.unwrap();
+    let run = || {
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_kommit"))
+            .args([
+                "branch",
+                "orders",
+                "replay",
+                "--bootstrap",
+                &addr.to_string(),
+            ])
+            .output()
+    };
+    let out = run().await.unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("replay/0 starts at offset 0"), "{stdout}");
+    assert!(broker.topic("replay").await.is_some());
+
+    let out = run().await.unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("already exists"), "{stderr}");
+}

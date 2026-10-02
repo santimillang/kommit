@@ -1,6 +1,7 @@
 pub mod api;
 pub mod branch;
 pub mod broker;
+pub mod cli;
 pub mod config;
 pub mod git;
 pub mod groups;

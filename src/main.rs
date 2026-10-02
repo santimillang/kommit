@@ -12,8 +12,34 @@ use tracing_subscriber::EnvFilter;
 
 /// Kafka, except every record is a Git commit.
 #[derive(Parser)]
-#[command(version)]
+#[command(version, args_conflicts_with_subcommands = true)]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+    #[command(flatten)]
+    serve: Serve,
+}
+
+#[derive(clap::Subcommand)]
+enum Command {
+    /// Fork a topic on a running broker. The new topic shares the source's history.
+    Branch {
+        /// The topic to fork.
+        from: String,
+        /// The new topic.
+        to: String,
+        /// `head`, an offset for every partition like `0:42,1:17`, or an RFC 3339 timestamp.
+        #[arg(long, default_value = "head")]
+        at: String,
+        /// The broker to ask.
+        #[arg(long, default_value = "localhost:9092")]
+        bootstrap: String,
+    },
+}
+
+/// Run the broker (the default when no subcommand is given).
+#[derive(clap::Args)]
+struct Serve {
     /// Bare Git repository holding all data (created if missing).
     #[arg(long, default_value = "kommit-data.git")]
     data: PathBuf,
@@ -42,6 +68,26 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
     let cli = Cli::parse();
+    match cli.command {
+        Some(Command::Branch {
+            from,
+            to,
+            at,
+            bootstrap,
+        }) => {
+            let starts = kommit::cli::branch(&bootstrap, &from, &to, &at).await?;
+            for (p, offset) in starts.iter().enumerate() {
+                println!(
+                    "{to}/{p} starts at offset {offset}, sharing {offset} record(s) with {from}/{p}"
+                );
+            }
+            Ok(())
+        }
+        None => serve(cli.serve).await,
+    }
+}
+
+async fn serve(cli: Serve) -> anyhow::Result<()> {
     let store = Arc::new(GitStore::open_or_init(&cli.data)?);
     let listener = TcpListener::bind(cli.listen).await?;
     let config = Config {
