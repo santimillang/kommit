@@ -462,6 +462,7 @@ mod tests {
         let spec = BranchSpec {
             from: "orders".into(),
             at: crate::branch::BranchAt::Head,
+            groups: crate::branch::BranchGroups::None,
         };
         let err = broker
             .branch_topic("replay", -1, &spec, false)
@@ -512,6 +513,7 @@ mod tests {
         let spec = BranchSpec {
             from: "orders".into(),
             at: crate::branch::BranchAt::Head,
+            groups: crate::branch::BranchGroups::None,
         };
         let forking = tokio::spawn({
             let broker = broker.clone();

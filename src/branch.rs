@@ -12,6 +12,7 @@ use crate::record::Offset;
 
 pub const BRANCH_FROM: &str = "kommit.branch.from";
 pub const BRANCH_AT: &str = "kommit.branch.at";
+pub const BRANCH_GROUPS: &str = "kommit.branch.groups";
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum BranchAt {
@@ -24,10 +25,46 @@ pub enum BranchAt {
     Timestamp(i64),
 }
 
+/// Which consumer groups' committed offsets the fork takes along (spec §7.2).
+#[derive(Debug, Clone, PartialEq)]
+pub enum BranchGroups {
+    None,
+    /// Every group with a committed offset on any source partition.
+    All,
+    Named(Vec<String>),
+}
+
+impl BranchGroups {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let s = s.trim();
+        if s.eq_ignore_ascii_case("none") {
+            return Ok(BranchGroups::None);
+        }
+        if s.eq_ignore_ascii_case("all") {
+            return Ok(BranchGroups::All);
+        }
+        let mut names: Vec<String> = Vec::new();
+        for name in s.split(',').map(str::trim) {
+            if name.is_empty() {
+                return Err(format!(
+                    "{BRANCH_GROUPS}={s:?}: empty group id; expected `none`, `all` or a \
+                     comma-separated list of groups"
+                ));
+            }
+            if names.iter().any(|n| n == name) {
+                return Err(format!("{BRANCH_GROUPS}: group {name} is listed twice"));
+            }
+            names.push(name.to_string());
+        }
+        Ok(BranchGroups::Named(names))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct BranchSpec {
     pub from: String,
     pub at: BranchAt,
+    pub groups: BranchGroups,
 }
 
 fn expected_forms(s: &str) -> String {
@@ -91,14 +128,17 @@ impl BranchSpec {
     pub fn from_configs<'a>(
         configs: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
     ) -> Result<Option<Self>, String> {
-        let (mut from, mut at): (Option<&str>, Option<&str>) = (None, None);
+        let (mut from, mut at, mut groups): (Option<&str>, Option<&str>, Option<&str>) =
+            (None, None, None);
         for (name, value) in configs {
             let slot = match name {
                 BRANCH_FROM => &mut from,
                 BRANCH_AT => &mut at,
+                BRANCH_GROUPS => &mut groups,
                 n if n.starts_with("kommit.") => {
                     return Err(format!(
-                        "unknown config {n}; kommit understands {BRANCH_FROM} and {BRANCH_AT}"
+                        "unknown config {n}; kommit understands {BRANCH_FROM}, {BRANCH_AT} \
+                         and {BRANCH_GROUPS}"
                     ));
                 }
                 _ => continue,
@@ -110,17 +150,25 @@ impl BranchSpec {
                 return Err(format!("{name} is given twice"));
             }
         }
-        match (from, at) {
-            (None, None) => Ok(None),
-            (None, Some(_)) => Err(format!("{BRANCH_AT} needs {BRANCH_FROM}")),
-            (Some(from), at) => Ok(Some(BranchSpec {
-                from: from.to_string(),
-                at: at
-                    .map(BranchAt::parse)
-                    .transpose()?
-                    .unwrap_or(BranchAt::Head),
-            })),
-        }
+        let Some(from) = from else {
+            return match at.or(groups) {
+                None => Ok(None),
+                Some(_) => Err(format!(
+                    "{BRANCH_AT} and {BRANCH_GROUPS} need {BRANCH_FROM}"
+                )),
+            };
+        };
+        Ok(Some(BranchSpec {
+            from: from.to_string(),
+            at: at
+                .map(BranchAt::parse)
+                .transpose()?
+                .unwrap_or(BranchAt::Head),
+            groups: groups
+                .map(BranchGroups::parse)
+                .transpose()?
+                .unwrap_or(BranchGroups::None),
+        }))
     }
 }
 
@@ -258,7 +306,8 @@ mod tests {
             spec,
             BranchSpec {
                 from: "orders".into(),
-                at: BranchAt::Head
+                at: BranchAt::Head,
+                groups: BranchGroups::None,
             }
         );
 
@@ -271,8 +320,25 @@ mod tests {
         .unwrap();
         assert_eq!(spec.at, offsets(&[(0, 1)]));
 
+        let groups = |v: &'static str| {
+            BranchSpec::from_configs([(BRANCH_FROM, Some("orders")), (BRANCH_GROUPS, Some(v))])
+                .map(|s| s.unwrap().groups)
+        };
+        assert_eq!(groups("none").unwrap(), BranchGroups::None);
+        assert_eq!(groups("ALL").unwrap(), BranchGroups::All);
+        assert_eq!(
+            groups("billing, audit").unwrap(),
+            BranchGroups::Named(vec!["billing".into(), "audit".into()])
+        );
+        assert!(groups("billing,,audit").unwrap_err().contains("empty"));
+        assert!(groups("a,a").unwrap_err().contains("twice"));
+
         for (configs, needle) in [
-            (vec![(BRANCH_AT, Some("head"))], "needs kommit.branch.from"),
+            (
+                vec![(BRANCH_GROUPS, Some("all"))],
+                "need kommit.branch.from",
+            ),
+            (vec![(BRANCH_AT, Some("head"))], "need kommit.branch.from"),
             (vec![(BRANCH_FROM, None)], "needs a value"),
             (
                 vec![(BRANCH_FROM, Some("a")), (BRANCH_FROM, Some("b"))],

@@ -174,6 +174,7 @@ async fn forks_of_forks_survive_a_restart_and_share_commits() {
     let spec = |from: &str, at: &str| BranchSpec {
         from: from.into(),
         at: BranchAt::parse(at).unwrap(),
+        groups: kommit::branch::BranchGroups::None,
     };
     {
         let broker = git_broker(&path).await;
