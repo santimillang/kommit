@@ -1,5 +1,7 @@
 //! Consumer groups: the coordinator state machine and how group ids appear in Git refs.
 
+pub mod coordinator;
+
 use crate::broker::validate_topic_name;
 
 /// A group id as one ref path component: raw when it is a valid topic-style name,
