@@ -4,7 +4,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
-use kafka_protocol::messages::{RequestHeader, ResponseHeader};
+use kafka_protocol::messages::create_topics_request::CreatableTopic;
+use kafka_protocol::messages::metadata_request::MetadataRequestTopic;
+use kafka_protocol::messages::{
+    CreateTopicsRequest, MetadataRequest, RequestHeader, ResponseHeader, TopicName,
+};
 use kafka_protocol::protocol::{Decodable, Encodable, HeaderVersion, Request, StrBytes};
 use kommit::broker::Broker;
 use kommit::config::Config;
@@ -36,6 +40,31 @@ pub async fn start_broker(storage: Arc<dyn Storage>) -> (SocketAddr, Arc<Broker>
 
 pub async fn start_mem_broker() -> (SocketAddr, Arc<Broker>) {
     start_broker(Arc::new(MemStorage)).await
+}
+
+pub fn topic_name(s: &str) -> TopicName {
+    TopicName(StrBytes::from_string(s.to_string()))
+}
+
+pub fn metadata_req(topics: Option<&[&str]>, auto_create: bool) -> MetadataRequest {
+    MetadataRequest::default()
+        .with_topics(topics.map(|ts| {
+            ts.iter()
+                .map(|t| MetadataRequestTopic::default().with_name(Some(topic_name(t))))
+                .collect()
+        }))
+        .with_allow_auto_topic_creation(auto_create)
+}
+
+pub fn create_topic_req(name: &str, partitions: i32) -> CreateTopicsRequest {
+    CreateTopicsRequest::default()
+        .with_timeout_ms(5000)
+        .with_topics(vec![
+            CreatableTopic::default()
+                .with_name(topic_name(name))
+                .with_num_partitions(partitions)
+                .with_replication_factor(-1),
+        ])
 }
 
 pub struct TestClient {
