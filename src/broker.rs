@@ -17,6 +17,9 @@ pub const MAX_PARTITIONS: i32 = 1000;
 
 pub struct TopicState {
     pub topic_id: Uuid,
+    /// The topic whose sentinels this topic's branches start at: its own name unless
+    /// it is a fork.
+    pub root: String,
     pub partitions: Vec<Arc<dyn PartitionLog>>,
 }
 
@@ -105,6 +108,7 @@ impl Broker {
                 t.name,
                 Arc::new(TopicState {
                     topic_id: t.topic_id,
+                    root: t.root,
                     partitions: t.partitions,
                 }),
             );
@@ -190,6 +194,7 @@ impl Broker {
             .map_err(|e| CreateTopicError::Storage(format!("{e:#}")))?;
         let state = Arc::new(TopicState {
             topic_id,
+            root: name.to_string(),
             partitions: logs,
         });
         topics.insert(name.to_string(), state.clone());
