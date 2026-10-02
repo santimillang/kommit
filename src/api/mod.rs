@@ -1,5 +1,6 @@
 pub mod api_versions;
 pub mod create_topics;
+pub mod fetch;
 pub mod metadata;
 pub mod produce;
 pub mod records;
@@ -16,6 +17,7 @@ pub const SUPPORTED: &[(ApiKey, i16, i16)] = &[
     (ApiKey::Metadata, 1, 12),
     (ApiKey::CreateTopics, 2, 7),
     (ApiKey::Produce, 3, 12),
+    (ApiKey::Fetch, 4, 12),
 ];
 
 pub fn supported_range(key: ApiKey) -> Option<(i16, i16)> {
@@ -51,6 +53,7 @@ pub async fn dispatch(
                 .await
                 .map(ResponseKind::Produce)
         }
+        RequestKind::Fetch(r) => Some(ResponseKind::Fetch(fetch::handle(broker, r).await)),
         // The server only dispatches APIs listed in SUPPORTED.
         _ => None,
     }
