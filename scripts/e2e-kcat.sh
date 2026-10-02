@@ -25,7 +25,7 @@ BIN="$ROOT/target/debug/kommit"
 
 start() {
   RUST_LOG="${RUST_LOG:-kommit=debug}" "$BIN" --data "$WORK/data.git" --listen "$BROKER" \
-    --advertised-host 127.0.0.1 >>"$WORK/broker.log" 2>&1 &
+    --advertised-host 127.0.0.1 --group-initial-rebalance-delay-ms 300 >>"$WORK/broker.log" 2>&1 &
   PID=$!
   for _ in $(seq 50); do
     "$KCAT" -b "$BROKER" -L -m 1 >/dev/null 2>&1 && return 0
@@ -55,5 +55,12 @@ git --git-dir="$WORK/data.git" fsck --strict --no-dangling
 git init --quiet --bare "$WORK/remote.git"
 git --git-dir="$WORK/data.git" push --quiet --all "$WORK/remote.git"
 [ "$(git --git-dir="$WORK/remote.git" log -1 --format=%s orders/0)" = "zipped" ]
+
+# Consumer groups: kcat -G joins, consumes everything, and commits on close.
+# The committed offset is a ref, so git itself can measure the lag.
+timeout 60 "$KCAT" -b "$BROKER" -G e2e-group -X auto.offset.reset=earliest -c 3 -q orders >"$WORK/group.out"
+[ "$(cat "$WORK/group.out")" = "$want" ] || { echo "group consume mismatch:"; cat "$WORK/group.out"; exit 1; }
+lag="$(git --git-dir="$WORK/data.git" rev-list --count refs/groups/e2e-group/orders/0..orders/0)"
+[ "$lag" = "0" ] || { echo "expected lag 0, git says $lag"; exit 1; }
 
 echo "e2e-kcat: OK"

@@ -16,3 +16,4 @@ jobs:
       - run: cargo test
       - run: sudo apt-get update && sudo apt-get install -y kcat
       - run: scripts/e2e-kcat.sh
+      - run: scripts/e2e-java.sh
