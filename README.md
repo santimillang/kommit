@@ -88,6 +88,11 @@ Under the hood it is a `CreateTopics` request with the configs `kommit.branch.fr
 `kafka-topics.sh` cannot: it rejects config names it does not know before sending anything.
 Writes to the fork diverge it and never touch the source.
 
+Consumer groups can come along: `--groups billing,audit` (or `all`) gives each group the
+same committed offset on the fork, capped at the fork point. That is just another ref
+pointing at the same commit, so a consumer resumes on the fork where it left off, and
+`git rev-list --count` still measures its lag.
+
 ## Things you can now do to a message queue
 
 - `git log` your event stream, with the producer's client id as the author

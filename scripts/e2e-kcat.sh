@@ -70,12 +70,18 @@ sleep 1.1
 cut="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 sleep 1.1
 printf 'new1\n' | "$KCAT" -b "$BROKER" -P -t events -p 0
-"$BIN" branch --bootstrap "$BROKER" --at "$cut" events events-replay
+# The reader group has read one record; the fork takes its offset along (spec §7.2).
+timeout 60 "$KCAT" -b "$BROKER" -G reader -X auto.offset.reset=earliest -c 1 -q events >"$WORK/reader.out"
+[ "$(cat "$WORK/reader.out")" = "old1" ] || { echo "reader got:"; cat "$WORK/reader.out"; exit 1; }
+"$BIN" branch --bootstrap "$BROKER" --at "$cut" --groups reader events events-replay
 
 got="$("$KCAT" -b "$BROKER" -C -t events-replay -p 0 -o beginning -e -q)"
 [ "$got" = $'old1\nold2' ] || { echo "fork replay mismatch:"; echo "$got"; exit 1; }
 timeout 60 "$KCAT" -b "$BROKER" -G replay-group -X auto.offset.reset=earliest -c 2 -q events-replay >"$WORK/replay.out"
 [ "$(cat "$WORK/replay.out")" = $'old1\nold2' ] || { echo "fork group mismatch:"; cat "$WORK/replay.out"; exit 1; }
+# ...and the reader resumes on the fork where it stopped on the source
+timeout 60 "$KCAT" -b "$BROKER" -G reader -X auto.offset.reset=earliest -c 1 -q events-replay >"$WORK/reader.out"
+[ "$(cat "$WORK/reader.out")" = "old2" ] || { echo "reader on the fork got:"; cat "$WORK/reader.out"; exit 1; }
 
 printf 'diverged\n' | "$KCAT" -b "$BROKER" -P -t events-replay -p 0
 got="$("$KCAT" -b "$BROKER" -C -t events -p 0 -o beginning -e -q)"
@@ -84,6 +90,9 @@ got="$("$KCAT" -b "$BROKER" -C -t events -p 0 -o beginning -e -q)"
 g() { git --git-dir="$WORK/data.git" "$@"; }
 [ "$(g rev-parse events-replay/0~1)" = "$(g rev-parse events/0~1)" ] || { echo "fork does not share commits"; exit 1; }
 [ "$(g merge-base events/0 events-replay/0)" = "$(g rev-parse events/0~1)" ] || { echo "unexpected merge base"; exit 1; }
+# the reader read everything shared on the fork; only the diverged record is unread
+lag="$(g rev-list --count refs/groups/reader/events-replay/0..events-replay/0)"
+[ "$lag" = "1" ] || { echo "reader lag on the fork: $lag"; exit 1; }
 g fsck --strict --no-dangling
 
 echo "e2e-kcat: OK"

@@ -7,7 +7,7 @@ use kafka_protocol::messages::list_offsets_request::{ListOffsetsPartition, ListO
 use kafka_protocol::messages::{BrokerId, CreateTopicsRequest, ListOffsetsRequest, TopicName};
 use kafka_protocol::protocol::StrBytes;
 
-use crate::branch::{BRANCH_AT, BRANCH_FROM};
+use crate::branch::{BRANCH_AT, BRANCH_FROM, BRANCH_GROUPS};
 use crate::net::client::Client;
 
 const LATEST: i64 = -1;
@@ -18,9 +18,16 @@ fn config(name: &str, value: &str) -> CreatableTopicConfig {
         .with_value(Some(StrBytes::from_string(value.to_string())))
 }
 
-/// Forks `from` as `to` on the broker at `bootstrap`. Returns where each partition of the
-/// fork starts: its high watermark, which is also how many records it shares with `from`.
-pub async fn branch(bootstrap: &str, from: &str, to: &str, at: &str) -> Result<Vec<i64>> {
+/// Forks `from` as `to` on the broker at `bootstrap`, taking the `groups` (`none`, `all`
+/// or a comma-separated list) along. Returns where each partition of the fork starts: its
+/// high watermark, which is also how many records it shares with `from`.
+pub async fn branch(
+    bootstrap: &str,
+    from: &str,
+    to: &str,
+    at: &str,
+    groups: &str,
+) -> Result<Vec<i64>> {
     let mut client = Client::connect(bootstrap).await?;
     let topic = TopicName(StrBytes::from_string(to.to_string()));
     let req = CreateTopicsRequest::default()
@@ -30,7 +37,11 @@ pub async fn branch(bootstrap: &str, from: &str, to: &str, at: &str) -> Result<V
                 .with_name(topic.clone())
                 .with_num_partitions(-1)
                 .with_replication_factor(-1)
-                .with_configs(vec![config(BRANCH_FROM, from), config(BRANCH_AT, at)]),
+                .with_configs(vec![
+                    config(BRANCH_FROM, from),
+                    config(BRANCH_AT, at),
+                    config(BRANCH_GROUPS, groups),
+                ]),
         ]);
     let resp = client.send(7, req).await?;
     let Some(result) = resp.topics.first() else {

@@ -31,6 +31,10 @@ enum Command {
         /// `head`, an offset for every partition like `0:42,1:17`, or an RFC 3339 timestamp.
         #[arg(long, default_value = "head")]
         at: String,
+        /// Consumer groups whose committed offsets the fork takes along: `none`, `all`, or
+        /// a comma-separated list.
+        #[arg(long, default_value = "none")]
+        groups: String,
         /// The broker to ask.
         #[arg(long, default_value = "localhost:9092")]
         bootstrap: String,
@@ -73,9 +77,10 @@ async fn main() -> anyhow::Result<()> {
             from,
             to,
             at,
+            groups,
             bootstrap,
         }) => {
-            let starts = kommit::cli::branch(&bootstrap, &from, &to, &at).await?;
+            let starts = kommit::cli::branch(&bootstrap, &from, &to, &at, &groups).await?;
             for (p, offset) in starts.iter().enumerate() {
                 println!(
                     "{to}/{p} starts at offset {offset}, sharing {offset} record(s) with {from}/{p}"

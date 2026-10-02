@@ -297,16 +297,34 @@ async fn the_cli_library_branches_and_reports_fork_points() {
     let mut c = common::TestClient::connect(addr).await;
     produce(&mut c, "orders", 0, &[(1, "a"), (2, "b")]).await;
 
-    let hws = kommit::cli::branch(&addr.to_string(), "orders", "replay", "0:1,1:0")
+    let bootstrap = addr.to_string();
+    let hws = kommit::cli::branch(&bootstrap, "orders", "replay", "0:1,1:0", "none")
         .await
         .unwrap();
     assert_eq!(hws, vec![1, 0]);
-    let err = kommit::cli::branch(&addr.to_string(), "nope", "x", "head")
+    let err = kommit::cli::branch(&bootstrap, "nope", "x", "head", "none")
         .await
         .unwrap_err();
     let msg = format!("{err:#}");
     assert!(msg.contains("nope does not exist"), "{msg}");
     assert!(msg.contains("InvalidConfig"), "{msg}");
+
+    let orders = broker.topic("orders").await.unwrap();
+    orders.partitions[0]
+        .commit_offset("billing", 1)
+        .await
+        .unwrap();
+    kommit::cli::branch(&bootstrap, "orders", "billed", "head", "billing")
+        .await
+        .unwrap();
+    let billed = broker.topic("billed").await.unwrap();
+    assert_eq!(
+        billed.partitions[0]
+            .committed_offset("billing")
+            .await
+            .unwrap(),
+        Some(1)
+    );
 }
 
 #[tokio::test]
