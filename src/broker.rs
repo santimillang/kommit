@@ -6,6 +6,7 @@ use tokio::sync::{RwLock, watch};
 use uuid::Uuid;
 
 use crate::api::produce::IdempotenceCache;
+use crate::branch::{self, BRANCH_FROM, BranchSpec, ResolveError};
 use crate::config::Config;
 use crate::groups::coordinator::Coordinator;
 use crate::log::PartitionLog;
@@ -39,6 +40,8 @@ pub enum CreateTopicError {
     InvalidName(String),
     #[error("invalid partition count {0}")]
     InvalidPartitions(i32),
+    #[error("{0}")]
+    InvalidConfig(String),
     #[error("storage error: {0}")]
     Storage(String),
 }
@@ -46,6 +49,7 @@ pub enum CreateTopicError {
 impl CreateTopicError {
     pub fn code(&self) -> i16 {
         match self {
+            CreateTopicError::InvalidConfig(_) => ResponseError::InvalidConfig.code(),
             CreateTopicError::AlreadyExists => ResponseError::TopicAlreadyExists.code(),
             CreateTopicError::InvalidName(_) => ResponseError::InvalidTopicException.code(),
             CreateTopicError::InvalidPartitions(_) => ResponseError::InvalidPartitions.code(),
@@ -200,6 +204,68 @@ impl Broker {
         topics.insert(name.to_string(), state.clone());
         tracing::info!(topic = name, partitions, "created topic");
         Ok(state)
+    }
+
+    /// Forks `spec.from` as `name`. Fork points are resolved before taking the topics lock
+    /// (a timestamp scan reads every commit), which is safe because logs only grow.
+    /// Returns the fork's partition count and, unless `validate_only`, the new topic.
+    pub async fn branch_topic(
+        &self,
+        name: &str,
+        num_partitions: i32,
+        spec: &BranchSpec,
+        validate_only: bool,
+    ) -> Result<(i32, Option<Arc<TopicState>>), CreateTopicError> {
+        validate_topic_name(name).map_err(CreateTopicError::InvalidName)?;
+        if self.topics.read().await.contains_key(name) {
+            return Err(CreateTopicError::AlreadyExists);
+        }
+        let source = self.topic(&spec.from).await.ok_or_else(|| {
+            CreateTopicError::InvalidConfig(format!(
+                "{BRANCH_FROM}: topic {} does not exist",
+                spec.from
+            ))
+        })?;
+        let count = source.partitions.len() as i32;
+        if num_partitions != -1 && num_partitions != count {
+            return Err(CreateTopicError::InvalidConfig(format!(
+                "a branch has its source's {count} partition(s); omit the partition count or pass {count}"
+            )));
+        }
+        let at = branch::resolve(&spec.at, &source.partitions)
+            .await
+            .map_err(|e| match e {
+                ResolveError::Invalid(msg) => CreateTopicError::InvalidConfig(msg),
+                ResolveError::Log(e) => CreateTopicError::Storage(e.to_string()),
+            })?;
+        if validate_only {
+            return Ok((count, None));
+        }
+        let mut topics = self.topics.write().await;
+        if topics.contains_key(name) {
+            return Err(CreateTopicError::AlreadyExists);
+        }
+        let topic_id = Uuid::new_v4();
+        let logs = self
+            .storage
+            .branch_topic(
+                name,
+                topic_id,
+                &spec.from,
+                &source.root,
+                &source.partitions,
+                &at,
+            )
+            .await
+            .map_err(|e| CreateTopicError::Storage(format!("{e:#}")))?;
+        let state = Arc::new(TopicState {
+            topic_id,
+            root: source.root.clone(),
+            partitions: logs,
+        });
+        topics.insert(name.to_string(), state.clone());
+        tracing::info!(topic = name, from = %spec.from, ?at, "branched topic");
+        Ok((count, Some(state)))
     }
 
     pub async fn get_or_auto_create(

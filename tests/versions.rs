@@ -335,6 +335,22 @@ async fn every_api_answers_at_every_advertised_version() {
             .await;
         assert_eq!(r.topics[0].error_code, 0, "CreateTopics v{v}");
     }
+    for v in range(ApiKey::CreateTopics) {
+        let r = c
+            .send(
+                v,
+                common::branch_topic_req(&format!("b-v{v}"), "orders", Some("head")),
+            )
+            .await;
+        assert_eq!(r.topics[0].error_code, 0, "branch CreateTopics v{v}");
+        let r = c
+            .send(
+                v,
+                common::branch_topic_req(&format!("bad-v{v}"), "nope", None),
+            )
+            .await;
+        assert_eq!(r.topics[0].error_code, 40, "branch error CreateTopics v{v}");
+    }
     for v in range(ApiKey::Produce) {
         let batch = encode_batch(&[(0, Record::text(1, "x"))]).unwrap();
         let r = c.send(v, common::produce_req("orders", 0, batch, 1)).await;

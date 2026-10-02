@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
-use kafka_protocol::messages::create_topics_request::CreatableTopic;
+use kafka_protocol::messages::create_topics_request::{CreatableTopic, CreatableTopicConfig};
 use kafka_protocol::messages::fetch_request::{FetchPartition, FetchTopic};
 use kafka_protocol::messages::list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic};
 use kafka_protocol::messages::metadata_request::MetadataRequestTopic;
@@ -69,6 +69,21 @@ pub fn create_topic_req(name: &str, partitions: i32) -> CreateTopicsRequest {
                 .with_num_partitions(partitions)
                 .with_replication_factor(-1),
         ])
+}
+
+pub fn branch_topic_req(name: &str, from: &str, at: Option<&str>) -> CreateTopicsRequest {
+    let config = |k: &str, v: &str| {
+        CreatableTopicConfig::default()
+            .with_name(StrBytes::from_string(k.to_string()))
+            .with_value(Some(StrBytes::from_string(v.to_string())))
+    };
+    let mut configs = vec![config("kommit.branch.from", from)];
+    if let Some(at) = at {
+        configs.push(config("kommit.branch.at", at));
+    }
+    let mut req = create_topic_req(name, -1);
+    req.topics[0].configs = configs;
+    req
 }
 
 pub fn produce_req(topic: &str, partition: i32, batch: Bytes, acks: i16) -> ProduceRequest {
