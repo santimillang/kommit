@@ -16,18 +16,23 @@ pub async fn serve(listener: TcpListener, broker: Arc<Broker>) -> Result<()> {
         let broker = broker.clone();
         // One task per connection: a panic in a handler drops this connection only.
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, broker).await {
+            let client_host = format!("/{}", peer.ip());
+            if let Err(e) = handle_connection(stream, broker, &client_host).await {
                 tracing::debug!(%peer, "connection closed: {e:#}");
             }
         });
     }
 }
 
-async fn handle_connection(mut stream: TcpStream, broker: Arc<Broker>) -> Result<()> {
+async fn handle_connection(
+    mut stream: TcpStream,
+    broker: Arc<Broker>,
+    client_host: &str,
+) -> Result<()> {
     stream.set_nodelay(true)?;
     // Requests on one connection are handled in order, like a Kafka broker's muted channel.
     while let Some(frame) = read_frame(&mut stream).await? {
-        if let Some(response) = handle_frame(&broker, frame).await? {
+        if let Some(response) = handle_frame(&broker, frame, client_host).await? {
             write_frame(&mut stream, &response).await?;
         }
     }
@@ -35,7 +40,11 @@ async fn handle_connection(mut stream: TcpStream, broker: Arc<Broker>) -> Result
 }
 
 /// Handles one request frame. `Ok(None)` means no response is due; `Err` closes the connection.
-pub async fn handle_frame(broker: &Broker, mut frame: Bytes) -> Result<Option<Bytes>> {
+pub async fn handle_frame(
+    broker: &Broker,
+    mut frame: Bytes,
+    client_host: &str,
+) -> Result<Option<Bytes>> {
     let header = decode_request_header_from_buffer(&mut frame)?;
     let api_key =
         ApiKey::try_from(header.request_api_key).map_err(|_| anyhow!("unknown API key"))?;
@@ -56,7 +65,12 @@ pub async fn handle_frame(broker: &Broker, mut frame: Bytes) -> Result<Option<By
         bail!("{api_key:?} v{version} is not supported");
     }
     let request = RequestKind::decode(api_key, &mut frame, version)?;
-    let Some(response) = api::dispatch(broker, &header, request).await else {
+    let ctx = api::RequestContext {
+        client_id: header.client_id.as_deref().unwrap_or("").to_string(),
+        client_host: client_host.to_string(),
+        version,
+    };
+    let Some(response) = api::dispatch(broker, &ctx, request).await else {
         return Ok(None);
     };
     Ok(Some(encode_response(

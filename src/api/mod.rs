@@ -1,13 +1,16 @@
 pub mod api_versions;
 pub mod create_topics;
 pub mod fetch;
+pub mod find_coordinator;
 pub mod list_offsets;
 pub mod metadata;
+pub mod offset_commit;
+pub mod offset_fetch;
 pub mod produce;
 pub mod records;
 
 use kafka_protocol::ResponseError;
-use kafka_protocol::messages::{ApiKey, RequestHeader, RequestKind, ResponseKind};
+use kafka_protocol::messages::{ApiKey, RequestKind, ResponseKind};
 
 use crate::broker::Broker;
 use crate::log::LogError;
@@ -20,6 +23,9 @@ pub const SUPPORTED: &[(ApiKey, i16, i16)] = &[
     (ApiKey::Produce, 3, 12),
     (ApiKey::Fetch, 4, 12),
     (ApiKey::ListOffsets, 1, 6),
+    (ApiKey::FindCoordinator, 0, 6),
+    (ApiKey::OffsetCommit, 2, 9),
+    (ApiKey::OffsetFetch, 1, 9),
 ];
 
 pub fn supported_range(key: ApiKey) -> Option<(i16, i16)> {
@@ -36,10 +42,18 @@ pub fn log_error_code(e: &LogError) -> i16 {
     }
 }
 
+/// Who sent a request, and at which API version.
+pub struct RequestContext {
+    pub client_id: String,
+    /// The peer address as Kafka's tools show it, e.g. `/127.0.0.1`.
+    pub client_host: String,
+    pub version: i16,
+}
+
 /// Returns `None` when the request gets no response (acks=0 produce).
 pub async fn dispatch(
     broker: &Broker,
-    header: &RequestHeader,
+    ctx: &RequestContext,
     request: RequestKind,
 ) -> Option<ResponseKind> {
     match request {
@@ -48,16 +62,22 @@ pub async fn dispatch(
         RequestKind::CreateTopics(r) => Some(ResponseKind::CreateTopics(
             create_topics::handle(broker, r).await,
         )),
-        RequestKind::Produce(r) => {
-            // The client id becomes the Git author of every record it produces.
-            let client_id = header.client_id.as_deref().unwrap_or("");
-            produce::handle(broker, client_id, r)
-                .await
-                .map(ResponseKind::Produce)
-        }
+        // The client id becomes the Git author of every record it produces.
+        RequestKind::Produce(r) => produce::handle(broker, &ctx.client_id, r)
+            .await
+            .map(ResponseKind::Produce),
         RequestKind::Fetch(r) => Some(ResponseKind::Fetch(fetch::handle(broker, r).await)),
         RequestKind::ListOffsets(r) => Some(ResponseKind::ListOffsets(
             list_offsets::handle(broker, r).await,
+        )),
+        RequestKind::FindCoordinator(r) => Some(ResponseKind::FindCoordinator(
+            find_coordinator::handle(broker, ctx, r),
+        )),
+        RequestKind::OffsetCommit(r) => Some(ResponseKind::OffsetCommit(
+            offset_commit::handle(broker, r).await,
+        )),
+        RequestKind::OffsetFetch(r) => Some(ResponseKind::OffsetFetch(
+            offset_fetch::handle(broker, ctx, r).await,
         )),
         // The server only dispatches APIs listed in SUPPORTED.
         _ => None,

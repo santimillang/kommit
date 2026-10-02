@@ -6,6 +6,7 @@ use tokio::sync::{RwLock, watch};
 use uuid::Uuid;
 
 use crate::config::Config;
+use crate::groups::coordinator::Coordinator;
 use crate::log::PartitionLog;
 use crate::storage::Storage;
 
@@ -90,6 +91,7 @@ pub struct Broker {
     appended: watch::Sender<u64>,
     producer_ids: tokio::sync::Mutex<ProducerIds>,
     known_groups: Vec<String>,
+    pub coordinator: Arc<Coordinator>,
 }
 
 impl Broker {
@@ -105,9 +107,12 @@ impl Broker {
                 }),
             );
         }
+        let coordinator =
+            Coordinator::start(config.group_initial_rebalance_delay, loaded.groups.clone());
         Ok(Arc::new(Broker {
             config,
             storage,
+            coordinator,
             topics: RwLock::new(topics),
             appended: watch::channel(0).0,
             producer_ids: tokio::sync::Mutex::new(ProducerIds {

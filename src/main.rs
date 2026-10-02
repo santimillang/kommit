@@ -29,6 +29,9 @@ struct Cli {
     auto_create_topics: bool,
     #[arg(long, default_value_t = 1)]
     default_partitions: i32,
+    /// Milliseconds a new consumer group waits for more members before its first rebalance.
+    #[arg(long, default_value_t = 3000)]
+    group_initial_rebalance_delay_ms: u64,
 }
 
 #[tokio::main]
@@ -50,6 +53,9 @@ async fn main() -> anyhow::Result<()> {
         auto_create_topics: cli.auto_create_topics,
         default_partitions: cli.default_partitions,
         cluster_id: "kommit".into(),
+        group_initial_rebalance_delay: std::time::Duration::from_millis(
+            cli.group_initial_rebalance_delay_ms,
+        ),
     };
     let broker = Broker::start(config, Arc::new(GitStorage::new(store))).await?;
     tracing::info!(data = %cli.data.display(), listen = %cli.listen, "kommit is up");
