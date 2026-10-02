@@ -132,6 +132,23 @@ impl MemStorage {
 /// Writes each group offset whose ref is missing. One that exists is left alone: the
 /// group may have committed on the fork since the offsets were recorded.
 async fn apply_group_offsets(logs: &[Arc<dyn PartitionLog>], groups: &[GroupOffset]) -> Result<()> {
+    apply_group_offsets_as(logs, groups, Restore::Strict).await
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Restore {
+    /// While branching: every offset lies within its fork point, so any failure is real.
+    Strict,
+    /// At startup: the fork may have been rewound by hand since, so an offset past its
+    /// head is skipped with a warning instead of keeping the broker down.
+    AtStartup,
+}
+
+async fn apply_group_offsets_as(
+    logs: &[Arc<dyn PartitionLog>],
+    groups: &[GroupOffset],
+    mode: Restore,
+) -> Result<()> {
     for g in groups {
         let log = usize::try_from(g.partition)
             .ok()
@@ -143,7 +160,18 @@ async fn apply_group_offsets(logs: &[Arc<dyn PartitionLog>], groups: &[GroupOffs
                 )
             })?;
         if log.committed_offset(&g.group).await?.is_none() {
-            log.commit_offset(&g.group, g.offset).await?;
+            match log.commit_offset(&g.group, g.offset).await {
+                Err(crate::log::LogError::OutOfRange(_)) if mode == Restore::AtStartup => {
+                    tracing::warn!(
+                        group = %g.group,
+                        partition = g.partition,
+                        offset = g.offset,
+                        high_watermark = log.high_watermark(),
+                        "recorded group offset is past the fork's head; not restoring it"
+                    );
+                }
+                other => other?,
+            }
         }
     }
     Ok(())
@@ -238,7 +266,7 @@ impl Storage for GitStorage {
                         })
                         .collect::<Result<Vec<_>>>()?;
                     let partitions = self.open_forks(&name, &root, &heads).await?;
-                    apply_group_offsets(&partitions, &group_offsets)
+                    apply_group_offsets_as(&partitions, &group_offsets, Restore::AtStartup)
                         .await
                         .with_context(|| format!("restoring group offsets on fork {name}"))?;
                     loaded.topics.push(LoadedTopic {
@@ -519,6 +547,46 @@ mod tests {
                 .await
                 .unwrap(),
             Some(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_recorded_group_offset_past_a_rewound_fork_does_not_stop_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.git");
+        {
+            let storage = open(&path);
+            let source = orders(&storage).await;
+            source[0].commit_offset("billing", 3).await.unwrap();
+            storage
+                .branch_topic(
+                    "replay",
+                    Uuid::new_v4(),
+                    "orders",
+                    "orders",
+                    &source,
+                    &[3, 1],
+                    &[go("billing", 0, 3)],
+                )
+                .await
+                .unwrap();
+            // an operator rewinds the fork by hand and deletes the group's ref
+            let s = &storage.store;
+            let head = s.ref_target("refs/heads/replay/0").unwrap().unwrap();
+            let one = s.first_parent_chain(head).unwrap()[1];
+            s.cas_ref("refs/heads/replay/0", Some(head), one, "rewind")
+                .unwrap();
+            git(&path, &["update-ref", "-d", "refs/groups/billing/replay/0"]);
+        }
+        let loaded = open(&path).load().await.unwrap();
+        let replay = loaded.topics.iter().find(|t| t.name == "replay").unwrap();
+        assert_eq!(replay.partitions[0].high_watermark(), 1);
+        assert_eq!(
+            replay.partitions[0]
+                .committed_offset("billing")
+                .await
+                .unwrap(),
+            None
         );
     }
 
