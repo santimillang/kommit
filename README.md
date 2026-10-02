@@ -6,9 +6,12 @@
 **Kafka, except every record is a Git commit.**
 
 kommit is a single Kafka broker written in Rust whose only storage is a Git
-repository. Point any Kafka client at it: `kcat`, librdkafka and friends just
-see a broker. Underneath, your topic is a branch, every message is a commit,
+repository. Point `kcat` or another librdkafka-based client at it and it just
+sees a broker. Underneath, your topic is a branch, every message is a commit,
 and `git log` is a consumer.
+
+> Consumer groups and idempotent producers arrive in M2. Until then, clients
+> that need them (the Java console tools, `kcat -G`) will not connect.
 
 It is a joke. It also passes `git fsck --strict`.
 

@@ -75,15 +75,19 @@ Each partition has **one writer task**; appends to a partition are serialized th
 
 | Kafka record | Git commit |
 |---|---|
-| value | commit message; if not valid UTF-8 (or contains NUL), base64-encoded and marked with the extra header `kommit-value-encoding base64` |
-| key | extra commit header `kommit-key` (base64 when binary, marked by `kommit-key-encoding base64`); absent when the key is null |
-| headers | extra commit headers `kommit-header-<index>` carrying `<base64 name> <base64 value>`, preserving order and duplicates |
-| null value (tombstone) | extra header `kommit-value-null`, empty message |
-| timestamp | committer time (milliseconds kept in extra header `kommit-timestamp-ms`, since Git stores seconds) |
-| producer | author `<client.id> <client.id@kommit>` |
+| value | commit message; if not valid UTF-8 (or contains NUL), base64-encoded and marked with the extra header `kommit-value base64` |
+| key | extra commit header `kommit-key <field>`; absent when the key is null |
+| headers | repeated extra commit headers `kommit-header <name-field> <value-field\|null>`, in order |
+| null value (tombstone) | extra header `kommit-value null`, empty message |
+| timestamp | extra header `kommit-ts <ms>`; committer time is the same instant in seconds, clamped to 0..year 9999 |
+| producer | author `<client.id> <client.id@kommit>`, client id sanitized to `[A-Za-z0-9._-]` (empty: `anonymous`) |
 | tree | the empty tree, shared by every commit |
 
-Exact header spellings are fixed in M1 and pinned by tests; the encoding must keep the
+A `<field>` is `t:<text>` when the bytes are non-empty printable ASCII without spaces,
+otherwise `b:<base64>` (so empty values survive Git's header format). Record header
+names collapse duplicates, because `kafka-protocol` decodes headers into a map.
+
+These spellings were fixed in M1 and are pinned by tests; the encoding must keep the
 repository `git fsck`-clean, which is asserted in CI.
 
 ### 4.3 Offsets and the sentinel root
@@ -138,9 +142,11 @@ of the partition. Producer timestamps are not guaranteed monotonic, so no binary
 
 ### 5.4 Topics
 
-Created by `CreateTopics`, or auto-created on first `Metadata`/`Produce` (configurable,
-default on so `kcat` works out of the box). Creation appends a `CreateTopic` meta event, then
-creates one sentinel-rooted branch per partition.
+Created by `CreateTopics`, or auto-created by a `Metadata` request that allows it
+(configurable, default on so `kcat` works out of the box). `Produce` never auto-creates:
+clients send `Metadata` first, as with Kafka. Partition counts are capped at 1000, and
+creation refuses branches that already exist; both are checked before the `CreateTopic`
+meta event is appended, then one sentinel-rooted branch is created per partition.
 
 ### 5.5 Startup
 
